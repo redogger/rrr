@@ -15,26 +15,53 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout repo
+      - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: 💾 Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: .dulms-state.json
+          key: dulms-state-v2
+          restore-keys: |
+            dulms-state-v2
+            dulms-state-v1
+
+      - name: 🟢 Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
 
-      - name: Install dependencies
-        run: npm install
+      - name: 📦 Install dependencies
+        run: npm install --no-audit --no-fund
 
-      - name: Install Playwright browsers
+      - name: 🎭 Install Playwright Chromium
         run: npx playwright install chromium --with-deps
 
-      - name: Run watcher
+      - name: 🔍 Run watcher
         env:
           DULMS_USERNAME: ${{ secrets.DULMS_USERNAME }}
           DULMS_PASSWORD: ${{ secrets.DULMS_PASSWORD }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          DURATION_MIN: '5'
+          DURATION_MIN: '4.5'
           CHECK_INTERVAL: '30'
         run: node watch.js
+
+      - name: 💾 Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .dulms-state.json
+          key: dulms-state-v2
+
+      - name: 📤 Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_id }}
+          path: |
+            .dulms-state.json
+          retention-days: 3
+          if-no-files-found: ignore
