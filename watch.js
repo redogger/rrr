@@ -1,14 +1,18 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- *  DULMS Watcher v2.0 — Premium Edition
+ *  DULMS Watcher v3.0 — Production Grade
  *  ─────────────────────────────────────────────────────────────────────────
- *  ✓ Runs on GitHub Actions 24/7 (your laptop can be off)
- *  ✓ Auto-login with session recovery
- *  ✓ Filters out registered/passed courses
- *  ✓ Detects NEW openings only (no spam)
- *  ✓ Persistent state across runs (GitHub cache)
- *  ✓ Telegram notifications with detailed info
- *  ✓ First-run baseline (silent mode)
- *  ✓ Graceful shutdown with cleanup
+ *  Improvements over v2.0:
+ *    ✓ Session persistence via storageState (Playwright best practice)
+ *    ✓ Multi-selector fallback (robust to DULMS changes)
+ *    ✓ Telegram rate-limit handling (30/sec) + retry on 429
+ *    ✓ Persists state to cache + artifact backup
+ *    ✓ First-run baseline (silent mode, no spam)
+ *    ✓ Registered/passed courses filtering
+ *    ✓ Graceful shutdown + interrupt support
+ *    ✓ Detailed logging with context
+ *    ✓ Auto re-login on session death (max 3 attempts)
+ *    ✓ Timezone-aware timestamps (Africa/Cairo)
+ *    ✓ Node.js 22 compatible
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 const { chromium } = require('playwright');
@@ -29,64 +33,87 @@ const CONFIG = {
   durationMin:      parseFloat(process.env.DURATION_MIN || '4.5'),
   checkIntervalSec: parseInt(process.env.CHECK_INTERVAL || '30', 10),
   stateFile:        path.join(process.cwd(), '.dulms-state.json'),
+  sessionFile:      path.join(process.cwd(), '.dulms-session.json'),
   interruptFile:    path.join(process.cwd(), '.dulms-interrupt'),
+  timezone:         'Africa/Cairo',
+  maxRelogins:      3,
   dryRun:           process.argv.includes('--dry-run'),
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  LOGGER
+//  LOGGER (with timestamps)
 // ═══════════════════════════════════════════════════════════════════════════
+const ts = () => new Date().toISOString().slice(11, 19);
 const log = {
-  info:  (...a) => console.log('[INFO]',  ...a),
-  ok:    (...a) => console.log('[ OK ]',  ...a),
-  warn:  (...a) => console.warn('[WARN]', ...a),
-  err:   (...a) => console.error('[FAIL]', ...a),
-  tg:    (...a) => console.log('[ TG ]',  ...a),
-  step:  (...a) => console.log('\n━━━', ...a, '━━━'),
+  info:  (...a) => console.log(`[${ts()}] [INFO]`,  ...a),
+  ok:    (...a) => console.log(`[${ts()}] [ OK ]`,  ...a),
+  warn:  (...a) => console.warn(`[${ts()}] [WARN]`, ...a),
+  err:   (...a) => console.error(`[${ts()}] [FAIL]`, ...a),
+  tg:    (...a) => console.log(`[${ts()}] [ TG ]`,  ...a),
+  step:  (...a) => console.log(`\n[${ts()}] ━━━`, ...a, '━━━'),
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  TELEGRAM
+//  TELEGRAM (with rate-limit handling + retry)
 // ═══════════════════════════════════════════════════════════════════════════
-async function sendTelegram(title, body, options = {}) {
+let lastTelegramCall = 0;
+const TG_MIN_INTERVAL = 40; // ms — يضمن أقل من 30 msg/sec
+
+async function sendTelegram(title, body, attempt = 1) {
   if (!CONFIG.tgToken || !CONFIG.tgChatId) {
     log.warn('Telegram not configured');
     return false;
   }
   if (CONFIG.dryRun) {
-    log.info('[DRY-RUN] Would send:', title);
+    log.info('[DRY-RUN] Telegram:', title);
     return true;
   }
+
+  // Rate limiting (30 msg/sec = 33ms بين كل طلب)
+  const now = Date.now();
+  const wait = Math.max(0, TG_MIN_INTERVAL - (now - lastTelegramCall));
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  lastTelegramCall = Date.now();
 
   const text = (title ? `🔔 *${title}*\n` : '') + (body || '');
   const url = `https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: CONFIG.tgChatId,
-          text,
-          parse_mode: 'Markdown',
-          disable_web_page_preview: true,
-        }),
-      });
-      const data = await res.json();
-      if (data.ok) { log.tg('✓ Sent'); return true; }
-      log.err('Telegram error:', data.description);
-      return false;
-    } catch (e) {
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: CONFIG.tgChatId,
+        text,
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+      }),
+    });
+    const data = await res.json();
+
+    if (data.ok) { log.tg('✓ Sent'); return true; }
+
+    // Rate limit reached
+    if (data.error_code === 429) {
+      const retryAfter = data.parameters?.retry_after || 30;
+      log.warn(`Telegram rate limited. Retry after ${retryAfter}s`);
       if (attempt < 3) {
-        log.warn(`Telegram retry ${attempt}/3 in 2s...`);
-        await new Promise(r => setTimeout(r, 2000));
-      } else {
-        log.err('Telegram failed after 3 attempts:', e.message);
+        await new Promise(r => setTimeout(r, (retryAfter + 2) * 1000));
+        return sendTelegram(title, body, attempt + 1);
       }
     }
+
+    log.err('Telegram error:', data.description);
+    return false;
+  } catch (e) {
+    if (attempt < 3) {
+      log.warn(`Telegram retry ${attempt}/3 in 2s...`);
+      await new Promise(r => setTimeout(r, 2000));
+      return sendTelegram(title, body, attempt + 1);
+    }
+    log.err('Telegram failed:', e.message);
+    return false;
   }
-  return false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -95,9 +122,9 @@ async function sendTelegram(title, body, options = {}) {
 function loadState() {
   try {
     if (fs.existsSync(CONFIG.stateFile)) {
-      const raw = fs.readFileSync(CONFIG.stateFile, 'utf8');
-      const state = JSON.parse(raw);
-      log.info(`State loaded: ${Object.keys(state).length} entries from ${state._lastUpdate || 'unknown'}`);
+      const state = JSON.parse(fs.readFileSync(CONFIG.stateFile, 'utf8'));
+      const n = Object.keys(state).filter(k => !k.startsWith('_')).length;
+      log.info(`State loaded: ${n} courses, last update: ${state._lastUpdate || 'never'}`);
       return state;
     }
   } catch (e) { log.warn('State read failed:', e.message); }
@@ -108,8 +135,13 @@ function saveState(state) {
   try {
     state._lastUpdate = new Date().toISOString();
     fs.writeFileSync(CONFIG.stateFile, JSON.stringify(state, null, 2));
-    log.ok(`State saved (${Object.keys(state).length - 1} entries)`);
+    const n = Object.keys(state).filter(k => !k.startsWith('_')).length;
+    log.ok(`State saved (${n} courses)`);
   } catch (e) { log.warn('State write failed:', e.message); }
+}
+
+function cleanupSession() {
+  try { if (fs.existsSync(CONFIG.sessionFile)) fs.unlinkSync(CONFIG.sessionFile); } catch (e) {}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -124,70 +156,103 @@ async function createBrowser() {
       '--disable-dev-shm-usage',
       '--disable-blink-features=AutomationControlled',
       '--disable-gpu',
+      '--no-zygote',
+      '--single-process', // يستخدم ذاكرة أقل
     ],
   });
 }
 
-async function createPage(browser) {
-  const context = await browser.newContext({
+async function createContext(browser, useStoredSession = true) {
+  const opts = {
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     viewport: { width: 1280, height: 720 },
     locale: 'en-US',
-    timezoneId: 'Africa/Cairo',
-  });
+    timezoneId: CONFIG.timezone,
+  };
+
+  // محاولة استخدام الجلسة المحفوظة (Playwright best practice)
+  if (useStoredSession && fs.existsSync(CONFIG.sessionFile)) {
+    try {
+      opts.storageState = CONFIG.sessionFile;
+      log.info('Using stored session');
+    } catch (e) {
+      log.warn('Session file corrupt, starting fresh');
+    }
+  }
+
+  const context = await browser.newContext(opts);
   const page = await context.newPage();
-  // سرعة تحميل: حجب الصور والـ fonts
+
+  // حجب الصور والـ fonts لتسريع التحميل
   await page.route('**/*', (route) => {
     const t = route.request().resourceType();
-    if (t === 'image' || t === 'font' || t === 'media' || t === 'stylesheet') {
-      return route.abort();
-    }
+    if (['image', 'font', 'media', 'stylesheet'].includes(t)) return route.abort();
     return route.continue();
   });
-  return page;
+
+  return { context, page };
+}
+
+async function saveSession(context) {
+  try {
+    await context.storageState({ path: CONFIG.sessionFile });
+    log.info('Session saved to disk');
+  } catch (e) {
+    log.warn('Session save failed:', e.message);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  LOGIN
+//  LOGIN (with multi-selector fallback)
 // ═══════════════════════════════════════════════════════════════════════════
+async function findFirstMatch(page, selectors, timeout = 5000) {
+  for (const sel of selectors) {
+    try {
+      const loc = page.locator(sel).first();
+      if (await loc.count() > 0) {
+        await loc.waitFor({ state: 'visible', timeout });
+        return sel;
+      }
+    } catch (e) { /* continue */ }
+  }
+  return null;
+}
+
 async function loginToDulms(page) {
   log.info('Logging in...');
   await page.goto(CONFIG.loginUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-  // اكتشاف حقول تسجيل الدخول
-  const userSelectors = ['input#LoginId', 'input[name="LoginId"]', 'input#txtUser', 'input[type="text"]'];
-  const passSelectors = ['input#Password', 'input[name="Password"]', 'input[type="password"]'];
-  const btnSelectors  = ['input[type="submit"]', 'button[type="submit"]', 'button#btnLogin'];
+  const userSel = await findFirstMatch(page, [
+    'input#LoginId', 'input[name="LoginId"]', 'input#txtUser',
+    'input[name="Username"]', 'input[type="text"]'
+  ]);
+  const passSel = await findFirstMatch(page, [
+    'input#Password', 'input[name="Password"]',
+    'input#txtPassword', 'input[type="password"]'
+  ]);
+  const btnSel = await findFirstMatch(page, [
+    'input[type="submit"]', 'button[type="submit"]',
+    'button#btnLogin', 'button.login-btn'
+  ]);
 
-  let userField = null, passField = null, btnField = null;
-
-  for (const sel of userSelectors) {
-    if (await page.locator(sel).count() > 0) { userField = sel; break; }
-  }
-  for (const sel of passSelectors) {
-    if (await page.locator(sel).count() > 0) { passField = sel; break; }
-  }
-  for (const sel of btnSelectors) {
-    if (await page.locator(sel).count() > 0) { btnField = sel; break; }
-  }
-
-  if (!userField || !passField || !btnField) {
-    throw new Error(`Login fields not found (u=${userField}, p=${passField}, b=${btnField})`);
+  if (!userSel || !passSel || !btnSel) {
+    throw new Error(`Login fields not found (user=${userSel}, pass=${passSel}, btn=${btnSel})`);
   }
 
-  await page.fill(userField, CONFIG.username);
-  await page.fill(passField, CONFIG.password);
+  log.info(`Fields: user="${userSel}", pass="${passSel}", btn="${btnSel}"`);
+
+  await page.fill(userSel, CONFIG.username);
+  await page.fill(passSel, CONFIG.password);
   await Promise.all([
     page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {}),
-    page.click(btnField),
+    page.click(btnSel),
   ]);
 
   const finalUrl = page.url();
-  if (!finalUrl.includes('/Login.aspx')) {
-    log.ok(`Logged in → ${finalUrl}`);
-  } else {
-    throw new Error('Login failed — still on login page');
+  if (finalUrl.includes('/Login.aspx') || finalUrl.includes('error')) {
+    throw new Error(`Login failed — still at ${finalUrl}`);
   }
+  log.ok(`Logged in → ${finalUrl}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -200,7 +265,7 @@ async function fetchAllCourses(page) {
   try {
     await page.waitForSelector('article.course-item', { timeout: 20000 });
   } catch (e) {
-    log.warn('No course items found in DOM');
+    log.warn('No course items in DOM');
     return [];
   }
 
@@ -213,7 +278,11 @@ async function fetchAllCourses(page) {
       else if (el.classList.contains('passed'))     status = 'passed';
       else if (el.classList.contains('failed'))     status = 'failed';
       else if (el.classList.contains('withdaw'))    status = 'withdrawn';
-      return { id: el.id, name: nameEl ? nameEl.innerText.trim() : '', status };
+      return {
+        id: el.id,
+        name: nameEl ? nameEl.innerText.trim() : '',
+        status,
+      };
     }).filter(c => c.name && c.id);
   });
 
@@ -222,7 +291,7 @@ async function fetchAllCourses(page) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CHECK SINGLE COURSE SCHEDULE
+//  CHECK COURSE SCHEDULE
 // ═══════════════════════════════════════════════════════════════════════════
 async function checkCourseSchedule(page, courseId) {
   try {
@@ -277,12 +346,11 @@ async function checkCourseSchedule(page, courseId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  FORMAT TELEGRAM MESSAGE
+//  TELEGRAM MESSAGE FORMATTERS
 // ═══════════════════════════════════════════════════════════════════════════
 function formatOpeningMessage(course, result) {
-  const lines = [];
-  const courseName = course.name.split(' - ').slice(1).join(' - ') || course.name;
   const courseCode = course.name.split(' - ')[0];
+  const lines = [];
 
   lines.push(`✅ *${result.count}* Group(s) متاحة للتسجيل`);
   lines.push('');
@@ -297,12 +365,11 @@ function formatOpeningMessage(course, result) {
   });
 
   if (result.groups.length > 5) {
-    lines.push('');
-    lines.push(`_و ${result.groups.length - 5} Group إضافية..._`);
+    lines.push(`\n_و ${result.groups.length - 5} Group إضافية..._`);
   }
 
   lines.push('');
-  lines.push(`🕐 ${new Date().toLocaleString('ar-EG', { timeZone: 'Africa/Cairo' })}`);
+  lines.push(`🕐 ${new Date().toLocaleString('ar-EG', { timeZone: CONFIG.timezone })}`);
   lines.push('');
   lines.push('🔗 افتح DULMS وسجّل فوراً!');
 
@@ -312,58 +379,96 @@ function formatOpeningMessage(course, result) {
   };
 }
 
+function formatBaselineMessage(watchable, prevState) {
+  const avail = watchable.filter(c => prevState[c.id]?.available);
+  const lines = [];
+
+  lines.push(`📚 *${watchable.length}* كورس تحت المراقبة`);
+  lines.push('');
+  lines.push(`✅ *${avail.length}* متاح حالياً:`);
+  lines.push('');
+  avail.slice(0, 15).forEach(c => lines.push(`  • ${c.name}`));
+  if (avail.length > 15) lines.push(`  _...و ${avail.length - 15} أخرى_`);
+
+  lines.push('');
+  lines.push(`🕐 ${new Date().toLocaleString('ar-EG', { timeZone: CONFIG.timezone })}`);
+  lines.push('');
+  lines.push('_ستصلك رسالة فوراً عند فتح أي كورس جديد_');
+
+  return {
+    title: '👁️ DULMS Watcher — بدأ المراقبة',
+    body: lines.join('\n'),
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  MAIN SCAN LOOP
 // ═══════════════════════════════════════════════════════════════════════════
 async function runScan(browser) {
-  const page = await createPage(browser);
+  let { context, page } = await createContext(browser, true);
 
   try {
-    // ── 1. Login ──
-    await loginToDulms(page);
+    // ─── 1. Login ───
+    let loggedIn = false;
 
-    // ── 2. Fetch courses ──
-    const courses = await fetchAllCourses(page);
-    if (!courses.length) {
-      throw new Error('No courses found — page structure may have changed');
+    // جرّب الجلسة المحفوظة أولاً
+    if (fs.existsSync(CONFIG.sessionFile)) {
+      try {
+        await page.goto(CONFIG.coursesUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+        const url = page.url();
+        if (url.includes('/Login.aspx') || url.includes('/Account/')) {
+          log.warn('Stored session expired — re-login');
+          cleanupSession();
+        } else {
+          log.ok('Reused stored session ✓');
+          loggedIn = true;
+        }
+      } catch (e) {
+        log.warn('Session check failed:', e.message);
+      }
     }
 
-    // ── 3. Filter registered/passed ──
+    if (!loggedIn) {
+      await loginToDulms(page);
+      await saveSession(context);
+    }
+
+    // ─── 2. Fetch courses ───
+    const courses = await fetchAllCourses(page);
+    if (!courses.length) throw new Error('No courses found');
+
+    // ─── 3. Filter ───
     const watchable = courses.filter(c => c.status === 'never');
     log.info(`Watching ${watchable.length}/${courses.length} courses (skip registered/passed/failed/withdrawn)`);
-    watchable.forEach(c => log.info(`  • ${c.id} — ${c.name}`));
 
     if (!watchable.length) {
-      log.warn('No watchable courses — all are registered/passed');
+      log.warn('No watchable courses');
       return;
     }
 
-    // ── 4. Load state ──
+    // ─── 4. State ───
     const prevState = loadState();
     const isFirstRun = !prevState._lastUpdate;
+    log.step(isFirstRun ? 'FIRST RUN — baseline mode' : 'RESUMED — will alert on new openings');
 
-    if (isFirstRun) {
-      log.step('FIRST RUN — baseline mode (no alerts, saving current state)');
-    } else {
-      log.step('RESUMED — will alert on new openings');
-    }
-
-    // ── 5. Scan loop ──
+    // ─── 5. Scan loop ───
     const endTime = Date.now() + CONFIG.durationMin * 60 * 1000;
     let round = 0;
-    const newOpenings = [];
+    let reLoginCount = 0;
 
     while (Date.now() < endTime) {
-      // Graceful interrupt
+      // Interrupt check
       if (fs.existsSync(CONFIG.interruptFile)) {
-        log.warn('Interrupt signal received — stopping early');
+        log.warn('Interrupt — stopping');
         try { fs.unlinkSync(CONFIG.interruptFile); } catch (e) {}
         break;
       }
 
       round++;
       const elapsed = ((Date.now() - (endTime - CONFIG.durationMin * 60 * 1000)) / 1000).toFixed(0);
-      log.step(`Round #${round} | elapsed ${elapsed}s | remaining ${((endTime - Date.now()) / 1000).toFixed(0)}s`);
+      const remaining = ((endTime - Date.now()) / 1000).toFixed(0);
+      log.step(`Round #${round} | ${elapsed}s elapsed | ${remaining}s remaining`);
 
       let sessionDead = false;
 
@@ -372,16 +477,24 @@ async function runScan(browser) {
 
         const result = await checkCourseSchedule(page, course.id);
 
-        // ── Session recovery ──
         if (result.sessionDead) {
-          log.warn('Session died — re-login attempt');
-          try {
-            await loginToDulms(page);
-            await page.goto(CONFIG.coursesUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-            sessionDead = false;
-            log.ok('Session restored');
-          } catch (e) {
-            log.err('Re-login failed:', e.message);
+          log.warn('Session died');
+          if (reLoginCount < CONFIG.maxRelogins) {
+            reLoginCount++;
+            try {
+              cleanupSession();
+              await loginToDulms(page);
+              await saveSession(context);
+              await page.goto(CONFIG.coursesUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+              log.ok(`Re-login #${reLoginCount} successful`);
+              sessionDead = false;
+              break; // restart this round
+            } catch (e) {
+              log.err('Re-login failed:', e.message);
+              sessionDead = true;
+            }
+          } else {
+            log.err('Max re-logins reached');
             sessionDead = true;
           }
           break;
@@ -392,71 +505,47 @@ async function runScan(browser) {
           continue;
         }
 
-        // ── Detect transition ──
         const key = course.id;
         const wasOpen = prevState[key]?.available || false;
         const nowOpen = result.available;
 
         if (nowOpen && !wasOpen && !isFirstRun) {
-          // 🎉 NEW OPENING
           log.ok(`🎉 ${course.name} — OPEN! (${result.count} groups)`);
           const msg = formatOpeningMessage(course, result);
-          const sent = await sendTelegram(msg.title, msg.body);
-          if (sent) newOpenings.push(course.name);
+          await sendTelegram(msg.title, msg.body);
         } else if (nowOpen) {
           log.ok(`${course.name} — متاح (${result.count})`);
         } else {
           log.info(`${course.name} — مقفول`);
         }
 
-        // ── Update state ──
         prevState[key] = {
           available: nowOpen,
           count: result.count || 0,
           lastCheck: Date.now(),
         };
 
-        // ── Politeness delay between courses ──
-        await new Promise(r => setTimeout(r, 800));
+        await new Promise(r => setTimeout(r, 800)); // تأخير بين الكورسات
       }
 
-      if (sessionDead) {
-        log.warn('Skipping rest of this round due to session death');
-      }
+      if (sessionDead) log.warn('Skipping rest of round');
 
-      // ── Save state after each round ──
       saveState(prevState);
 
-      // ── Wait before next round ──
-      const remaining = endTime - Date.now();
-      if (remaining > CONFIG.checkIntervalSec * 1000) {
+      const remainingMs = endTime - Date.now();
+      if (remainingMs > CONFIG.checkIntervalSec * 1000) {
         log.info(`Sleeping ${CONFIG.checkIntervalSec}s...`);
         await new Promise(r => setTimeout(r, CONFIG.checkIntervalSec * 1000));
       }
     }
 
-    // ── 6. Summary ──
-    log.step('SCAN COMPLETE');
-    log.info(`Rounds: ${round}`);
-    log.info(`New openings: ${newOpenings.length}`);
-
-    // ── 7. First-run baseline notification ──
+    // ─── 6. Baseline notification ───
     if (isFirstRun) {
-      const nowAvailable = watchable.filter(c => prevState[c.id]?.available);
-      const body = [
-        `📚 *${watchable.length}* كورس تحت المراقبة`,
-        `✅ *${nowAvailable.length}* متاح حالياً:`,
-        '',
-        ...nowAvailable.slice(0, 15).map(c => `  • ${c.name}`),
-        nowAvailable.length > 15 ? `  _...و ${nowAvailable.length - 15} أخرى_` : '',
-        '',
-        `🕐 ${new Date().toLocaleString('ar-EG', { timeZone: 'Africa/Cairo' })}`,
-        '',
-        '_ستصلك رسالة فوراً عند فتح أي كورس جديد_',
-      ].filter(Boolean).join('\n');
-
-      await sendTelegram('👁️ DULMS Watcher — بدأ المراقبة', body);
+      const msg = formatBaselineMessage(watchable, prevState);
+      await sendTelegram(msg.title, msg.body);
     }
+
+    log.step(`SCAN COMPLETE — ${round} rounds`);
 
   } catch (e) {
     log.err('FATAL:', e.message);
@@ -466,7 +555,7 @@ async function runScan(browser) {
     );
     throw e;
   } finally {
-    await page.close();
+    await context.close();
   }
 }
 
@@ -477,7 +566,7 @@ async function runScan(browser) {
   const t0 = Date.now();
 
   console.log('\n═══════════════════════════════════════════════');
-  console.log('  👁️  DULMS Watcher v2.0 — Premium Edition');
+  console.log('  👁️  DULMS Watcher v3.0 — Production Grade');
   console.log('═══════════════════════════════════════════════');
   console.log(`  User:       ${CONFIG.username ? CONFIG.username.slice(0, 4) + '***' : '❌ MISSING'}`);
   console.log(`  Password:   ${CONFIG.password ? '✓ set' : '❌ MISSING'}`);
@@ -496,8 +585,8 @@ async function runScan(browser) {
   const browser = await createBrowser();
 
   // Graceful shutdown
-  const shutdown = async (signal) => {
-    log.warn(`Received ${signal} — shutting down`);
+  const shutdown = async (sig) => {
+    log.warn(`Received ${sig} — shutting down`);
     try { fs.writeFileSync(CONFIG.interruptFile, '1'); } catch (e) {}
     try { await browser.close(); } catch (e) {}
     process.exit(0);
