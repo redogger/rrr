@@ -1,14 +1,10 @@
 name: DULMS Watcher
 
 on:
-  # ⚠️ ملاحظة: GitHub cron غير موثوق 100%
-  # يمكن أن يتأخر 5-15 دقيقة في أوقات الذروة
-  # حتى مع الجدولة كل 5 دقايق، التغطية الفعلية ~85-95%
   schedule:
-    - cron: '2-59/5 * * * *'   # يبدأ في الدقيقة 2 و 7 و 12... (تفادي بداية الساعة)
+    - cron: '2-59/5 * * * *'
   workflow_dispatch:
 
-# منع التشغيل المتوازي
 concurrency:
   group: dulms-watcher
   cancel-in-progress: false
@@ -22,12 +18,10 @@ jobs:
     timeout-minutes: 12
 
     steps:
-      - name: 📥 Checkout repo
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ─── استعادة الحالة (مع fallback للنسخ الاحتياطي) ───
-      - name: 💾 Restore state from cache
-        id: cache-state
+      - name: Restore state from cache
         uses: actions/cache/restore@v4
         with:
           path: .dulms-state.json
@@ -35,32 +29,19 @@ jobs:
           restore-keys: |
             dulms-state-v3
             dulms-state-v2
-            dulms-state-v1
 
-      - name: 📥 Fallback: Restore from latest artifact
-        if: steps.cache-state.outputs.cache-hit != 'true'
-        uses: dawidd6/action-download-artifact@v6
-        continue-on-error: true
-        with:
-          name: dulms-state
-          path: .
-          if_no_artifact_found: ignore
-
-      # ─── إعداد Node.js ───
-      - name: 🟢 Setup Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
 
-      # ─── تثبيت المكتبات (بدون cache لتجنب مشكلة lock file) ───
-      - name: 📦 Install dependencies
+      - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: 🎭 Install Playwright Chromium
+      - name: Install Playwright Chromium
         run: npx playwright install chromium --with-deps
 
-      # ─── تشغيل الـ Watcher ───
-      - name: 🔍 Run watcher
+      - name: Run watcher
         env:
           DULMS_USERNAME: ${{ secrets.DULMS_USERNAME }}
           DULMS_PASSWORD: ${{ secrets.DULMS_PASSWORD }}
@@ -70,15 +51,14 @@ jobs:
           CHECK_INTERVAL: '30'
         run: node watch.js
 
-      # ─── حفظ الحالة (cache + artifact) ───
-      - name: 💾 Save state to cache
+      - name: Save state to cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: .dulms-state.json
           key: dulms-state-v3
 
-      - name: 📤 Upload state as artifact (backup)
+      - name: Upload state as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -86,15 +66,4 @@ jobs:
           path: .dulms-state.json
           retention-days: 30
           overwrite: true
-          if-no-files-found: ignore
-
-      - name: 📤 Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: failure-logs-${{ github.run_id }}
-          path: |
-            .dulms-state.json
-            *.log
-          retention-days: 3
           if-no-files-found: ignore
