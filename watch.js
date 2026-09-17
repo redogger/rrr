@@ -22,19 +22,18 @@ const path = require('path');
 //  🎯 إعدادات المستخدم — عدّل هنا فقط
 // ═══════════════════════════════════════════════════════════════════════════
 const USER_CONFIG = {
+  // ✅ لا ترسل رسالة "بدأ المراقبة" في أول تشغيل
+  sendBaselineMessage: false,
+
   // ⭐ المواد اللي عايز إشعار عنها **دايماً** حتى لو اتبعت قبل كده
-  // (bypass dedup)
   alwaysNotify: [
     'ENG',
     'ENGLISH',
-    // ضيف أي مادة تانية هنا
   ],
 
   // 🚫 المواد اللي **مش عايز** إشعارات عنها خالص
   neverNotify: [
-    // مثال:
     // 'MEC 151',
-    // 'CIV141',
   ],
 
   // 📜 الكود بيملأها تلقائياً — متعدلهاش يدوياً
@@ -598,7 +597,7 @@ async function runScan(browser) {
       }
     }
 
-    if (isFirstRun) {
+    if (isFirstRun && USER_CONFIG.sendBaselineMessage !== false) {
       const msg = fmtBaseline(watchable, state);
       await sendTelegram(msg.title, msg.body);
     }
