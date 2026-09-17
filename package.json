@@ -1,7 +1,7 @@
 {
   "name": "dulms-watcher",
-  "version": "3.0.0",
-  "description": "DULMS Course Watcher v3.0 — Production Grade with Telegram notifications",
+  "version": "4.0.0",
+  "description": "DULMS Course Watcher v4.0 - Smart Dedup + Cookie-First + Always-Notify",
   "main": "watch.js",
   "scripts": {
     "start": "node watch.js",
