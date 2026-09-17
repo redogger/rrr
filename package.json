@@ -1,14 +1,14 @@
 {
   "name": "dulms-watcher",
-  "version": "2.0.0",
-  "description": "DULMS Course Watcher - Premium Edition with Telegram notifications",
+  "version": "3.0.0",
+  "description": "DULMS Course Watcher v3.0 — Production Grade with Telegram notifications",
   "main": "watch.js",
   "scripts": {
     "start": "node watch.js",
     "test": "node watch.js --dry-run"
   },
   "dependencies": {
-    "playwright": "^1.40.0"
+    "playwright": "^1.49.0"
   },
   "engines": {
     "node": ">=20"
