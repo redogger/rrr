@@ -1,14 +1,17 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- *  DULMS Watcher v4.0 — Smart Dedup Edition
+ *  DULMS Watcher v4.0 — Smart Dedup + Cookie-First + Always-Notify
  *  ─────────────────────────────────────────────────────────────────────────
- *  Core features:
+ *  Features:
  *    ✓ Cookie-first: reuse session until it expires
  *    ✓ Smart dedup: never notify same course twice (unless in alwaysNotify)
- *    ✓ Always-notify list: specific courses that bypass dedup (e.g., ENG101)
- *    ✓ Persistent state: tracks notified courses forever
+ *    ✓ Always-notify list: bypass dedup for specific courses (e.g., ENG)
+ *    ✓ Never-notify list: silent ignore for courses you don't care about
+ *    ✓ Persistent state across runs (GitHub cache + artifact backup)
  *    ✓ Fast fetch: every 10 seconds
- *    ✓ Auto re-login: only when session actually dies
+ *    ✓ Auto re-login only when session actually dies
  *    ✓ Baseline on first run: silent, no spam
+ *    ✓ Adaptive delays to prevent rate limiting
+ *    ✓ Telegram notifications with detailed info
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 const { chromium } = require('playwright');
@@ -19,26 +22,28 @@ const path = require('path');
 //  🎯 إعدادات المستخدم — عدّل هنا فقط
 // ═══════════════════════════════════════════════════════════════════════════
 const USER_CONFIG = {
-  // المواد اللي عايز تستقبل إشعار عنها **دايماً** حتى لو اتبعتت قبل كده
+  // ⭐ المواد اللي عايز إشعار عنها **دايماً** حتى لو اتبعت قبل كده
   // (bypass dedup)
   alwaysNotify: [
-    'ENG',      // أي مادة فيها ENG
+    'ENG',
     'ENGLISH',
     // ضيف أي مادة تانية هنا
   ],
 
-  // المواد اللي **مش عايز** إشعارات عنها خالص (silent ignore)
+  // 🚫 المواد اللي **مش عايز** إشعارات عنها خالص
   neverNotify: [
     // مثال:
-    // 'CIV280',
+    // 'MEC 151',
     // 'CIV141',
   ],
 
-  // المواد اللي **اتبعتها قبل كده** — الكود هيملأها تلقائياً
-  // مش محتاج تعدلها يدوياً
+  // 📜 الكود بيملأها تلقائياً — متعدلهاش يدوياً
   alreadyNotified: [],
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  CONFIG
+// ═══════════════════════════════════════════════════════════════════════════
 const CONFIG = {
   baseUrl:          'https://dulms.deltauniv.edu.eg',
   loginUrl:         'https://dulms.deltauniv.edu.eg/Login.aspx',
@@ -50,9 +55,9 @@ const CONFIG = {
   tgChatId:         process.env.TG_CHAT_ID || '',
   durationMin:      parseFloat(process.env.DURATION_MIN || '4.5'),
 
-  fetchIntervalSec: 10,      // فحص كل 10 ثواني
-  courseDelayMs:    500,     // تأخير بين الكورسات
-  cookieMaxAgeMin:  15,      // صلاحية الكوكيز
+  fetchIntervalSec: 10,
+  courseDelayMs:    500,
+  cookieMaxAgeMin:  15,
   maxRelogins:      5,
 
   stateFile:        path.join(process.cwd(), '.dulms-state.json'),
@@ -94,7 +99,12 @@ async function sendTelegram(title, body) {
     const res = await fetch(`https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: CONFIG.tgChatId, text, parse_mode: 'Markdown', disable_web_page_preview: true }),
+      body: JSON.stringify({
+        chat_id: CONFIG.tgChatId,
+        text,
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+      }),
     });
     const data = await res.json();
     if (data.ok) { log.tg('✓ Sent'); return true; }
@@ -106,7 +116,10 @@ async function sendTelegram(title, body) {
     }
     log.err('TG:', data.description);
     return false;
-  } catch (e) { log.err('TG fetch:', e.message); return false; }
+  } catch (e) {
+    log.err('TG fetch:', e.message);
+    return false;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -116,13 +129,15 @@ function loadState() {
   try {
     if (fs.existsSync(CONFIG.stateFile)) {
       const s = JSON.parse(fs.readFileSync(CONFIG.stateFile, 'utf8'));
-      // دمج قائمة alreadyNotified مع USER_CONFIG
       if (s._alreadyNotified && Array.isArray(s._alreadyNotified)) {
         USER_CONFIG.alreadyNotified = s._alreadyNotified;
       }
+      if (!s.courses) s.courses = {};
       return s;
     }
-  } catch (e) { log.warn('State read failed:', e.message); }
+  } catch (e) {
+    log.warn('State read failed:', e.message);
+  }
   return { _lastUpdate: 0, _alreadyNotified: [], courses: {} };
 }
 
@@ -131,40 +146,53 @@ function saveState(state) {
     state._lastUpdate = new Date().toISOString();
     state._alreadyNotified = USER_CONFIG.alreadyNotified;
     fs.writeFileSync(CONFIG.stateFile, JSON.stringify(state, null, 2));
-  } catch (e) { log.warn('State write failed:', e.message); }
+  } catch (e) {
+    log.warn('State write failed:', e.message);
+  }
 }
 
-// ═══ Session meta (cookie age) ═══
+// ═══ Session meta ═══
 function loadSessionMeta() {
-  try { if (fs.existsSync(CONFIG.sessionMetaFile)) return JSON.parse(fs.readFileSync(CONFIG.sessionMetaFile, 'utf8')); }
-  catch (e) {}
+  try {
+    if (fs.existsSync(CONFIG.sessionMetaFile)) {
+      return JSON.parse(fs.readFileSync(CONFIG.sessionMetaFile, 'utf8'));
+    }
+  } catch (e) {}
   return { savedAt: 0 };
 }
+
 function saveSessionMeta() {
-  try { fs.writeFileSync(CONFIG.sessionMetaFile, JSON.stringify({ savedAt: Date.now() })); }
-  catch (e) {}
+  try {
+    fs.writeFileSync(CONFIG.sessionMetaFile, JSON.stringify({ savedAt: Date.now() }));
+  } catch (e) {}
 }
+
 function sessionAgeMinutes() {
   const m = loadSessionMeta();
   return m.savedAt ? (Date.now() - m.savedAt) / 60000 : Infinity;
 }
+
 function cleanupSession() {
   try { if (fs.existsSync(CONFIG.sessionFile)) fs.unlinkSync(CONFIG.sessionFile); } catch (e) {}
   try { if (fs.existsSync(CONFIG.sessionMetaFile)) fs.unlinkSync(CONFIG.sessionMetaFile); } catch (e) {}
 }
+
 async function saveSession(ctx) {
-  try { await ctx.storageState({ path: CONFIG.sessionFile }); saveSessionMeta(); }
-  catch (e) {}
+  try {
+    await ctx.storageState({ path: CONFIG.sessionFile });
+    saveSessionMeta();
+    log.info('Cookies saved');
+  } catch (e) {}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  🎯 SMART NOTIFICATION LOGIC — قلب النظام
+//  🎯 SMART NOTIFICATION LOGIC
 // ═══════════════════════════════════════════════════════════════════════════
 function shouldNotify(course, result) {
   const name = course.name.toUpperCase();
   const code = course.name.split(' - ')[0].toUpperCase();
 
-  // 1. Never-notify list (highest priority)
+  // 1. Never-notify list
   for (const skip of USER_CONFIG.neverNotify) {
     if (name.includes(skip.toUpperCase())) {
       return { notify: false, reason: 'in neverNotify list' };
@@ -174,17 +202,17 @@ function shouldNotify(course, result) {
   // 2. Always-notify list (bypass dedup)
   for (const always of USER_CONFIG.alwaysNotify) {
     if (name.includes(always.toUpperCase())) {
-      return { notify: true, reason: 'in alwaysNotify list (bypass dedup)', bypass: true };
+      return { notify: true, reason: 'alwaysNotify (bypass dedup)', bypass: true };
     }
   }
 
-  // 3. Dedup: has this course been notified before?
+  // 3. Dedup
   const wasNotified = USER_CONFIG.alreadyNotified.includes(code);
   if (wasNotified) {
     return { notify: false, reason: 'already notified before (dedup)' };
   }
 
-  // 4. Not notified before → notify
+  // 4. First time
   return { notify: true, reason: 'first time opening' };
 }
 
@@ -202,8 +230,13 @@ function markAsNotified(course) {
 async function createBrowser() {
   return await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-           '--disable-blink-features=AutomationControlled', '--disable-gpu'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-gpu',
+    ],
   });
 }
 
@@ -214,6 +247,7 @@ async function createPage(browser, useCookies = true) {
     locale: 'en-US',
     timezoneId: CONFIG.timezone,
   };
+
   let cookiesLoaded = false;
   if (useCookies && fs.existsSync(CONFIG.sessionFile)) {
     try {
@@ -222,6 +256,7 @@ async function createPage(browser, useCookies = true) {
       log.info(`Cookies loaded (age: ${sessionAgeMinutes().toFixed(1)} min)`);
     } catch (e) {}
   }
+
   const context = await browser.newContext(opts);
   const page = await context.newPage();
   await page.route('**/*', (route) => {
@@ -229,6 +264,7 @@ async function createPage(browser, useCookies = true) {
     if (['image', 'font', 'media', 'stylesheet'].includes(t)) return route.abort();
     return route.continue();
   });
+
   return { context, page, cookiesLoaded };
 }
 
@@ -239,7 +275,10 @@ async function findFirst(page, sels) {
   for (const s of sels) {
     try {
       const l = page.locator(s).first();
-      if (await l.count() > 0) { await l.waitFor({ state: 'visible', timeout: 5000 }); return s; }
+      if (await l.count() > 0) {
+        await l.waitFor({ state: 'visible', timeout: 5000 });
+        return s;
+      }
     } catch (e) {}
   }
   return null;
@@ -248,16 +287,20 @@ async function findFirst(page, sels) {
 async function loginToDulms(page) {
   log.info('Login (fresh)...');
   await page.goto(CONFIG.loginUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
   const u = await findFirst(page, ['input#LoginId', 'input[name="LoginId"]', 'input#txtUser', 'input[type="text"]']);
   const p = await findFirst(page, ['input#Password', 'input[name="Password"]', 'input[type="password"]']);
   const b = await findFirst(page, ['input[type="submit"]', 'button[type="submit"]']);
+
   if (!u || !p || !b) throw new Error('Login fields not found');
+
   await page.fill(u, CONFIG.username);
   await page.fill(p, CONFIG.password);
   await Promise.all([
     page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {}),
     page.click(b),
   ]);
+
   if (page.url().includes('/Login.aspx')) throw new Error('Login failed');
   log.ok('Logged in');
 }
@@ -266,15 +309,23 @@ async function validateCookies(page) {
   try {
     await page.goto(CONFIG.coursesUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+
     if (page.url().includes('/Login.aspx') || page.url().includes('/Account/')) {
       log.warn('Cookies expired');
       return false;
     }
+
     const cnt = await page.locator('article.course-item').count();
-    if (cnt === 0) { log.warn('No courses in page'); return false; }
+    if (cnt === 0) {
+      log.warn('No courses in page');
+      return false;
+    }
     log.ok(`Cookies valid (${cnt} courses)`);
     return true;
-  } catch (e) { log.warn('Cookie validation failed:', e.message); return false; }
+  } catch (e) {
+    log.warn('Cookie validation failed:', e.message);
+    return false;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -283,8 +334,13 @@ async function validateCookies(page) {
 async function fetchAllCourses(page) {
   await page.goto(CONFIG.coursesUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
-  try { await page.waitForSelector('article.course-item', { timeout: 20000 }); }
-  catch (e) { return []; }
+
+  try {
+    await page.waitForSelector('article.course-item', { timeout: 20000 });
+  } catch (e) {
+    return [];
+  }
+
   return await page.evaluate(() => {
     return Array.from(document.querySelectorAll('article.course-item[id]')).map(el => {
       const n = el.querySelector('.course-name');
@@ -306,38 +362,56 @@ async function checkCourse(page, id) {
       const raw = (await res.text()).trim();
       if (raw === '-1' || raw === '""' || raw.charAt(0) === '<') return { sessionDead: true };
       if (raw === '' || raw === 'null' || raw === '[]') return { empty: true };
-      try { return { data: JSON.parse(raw) }; } catch (e) { return { error: 'parse' }; }
+      try { return { data: JSON.parse(raw) }; }
+      catch (e) { return { error: 'parse' }; }
     }, id);
+
     if (r.sessionDead) return { sessionDead: true };
     if (r.empty || r.error || !Array.isArray(r.data)) return { available: false, count: 0 };
+
     const groups = {};
     for (const item of r.data) {
       if (item.Type !== 'Group') continue;
       const gid = item.GroupId;
       if (!groups[gid]) {
         groups[gid] = {
-          name: item.GroupName, blocked: !!item.IsBlocked,
+          name: item.GroupName,
+          blocked: !!item.IsBlocked,
           total: parseInt(item.StudentsCount, 10) || 0,
           registered: parseInt(item.RegisteredCount, 10) || 0,
           slots: [],
         };
       }
-      groups[gid].slots.push({ day: item.DayWeekName, time: item.Time, hall: item.ClassRoomName });
+      groups[gid].slots.push({
+        day: item.DayWeekName,
+        time: item.Time,
+        hall: item.ClassRoomName,
+      });
     }
+
     const available = Object.values(groups)
       .filter(g => !g.blocked && (g.total - g.registered) > 0)
-      .map(g => ({ name: g.name, open: g.total - g.registered, total: g.total, firstSlot: g.slots[0] || null }))
+      .map(g => ({
+        name: g.name,
+        open: g.total - g.registered,
+        total: g.total,
+        firstSlot: g.slots[0] || null,
+      }))
       .sort((a, b) => b.open - a.open);
+
     return { available: available.length > 0, count: available.length, groups: available };
-  } catch (e) { return { error: e.message }; }
+  } catch (e) {
+    return { error: e.message };
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  MESSAGE FORMATTERS
 // ═══════════════════════════════════════════════════════════════════════════
-function fmtOpening(course, r, reason) {
+function fmtOpening(course, r, isAlwaysNotify) {
   const code = course.name.split(' - ')[0];
-  const L = [`✅ *${r.count}* Group(s) متاحة`, ''];
+  const L = [`✅ *${r.count}* Group(s) متاحة للتسجيل`, ''];
+
   r.groups.slice(0, 5).forEach((g, i) => {
     L.push(`*${i + 1}. ${g.name}*   💺 ${g.open}/${g.total}`);
     if (g.firstSlot) {
@@ -346,22 +420,40 @@ function fmtOpening(course, r, reason) {
     }
     if (i < Math.min(4, r.groups.length - 1)) L.push('');
   });
-  if (r.groups.length > 5) L.push(`\n_و ${r.groups.length - 5} أخرى_`);
-  L.push('', `🕐 ${new Date().toLocaleString('ar-EG', { timeZone: CONFIG.timezone })}`);
-  if (reason === 'alwaysNotify') L.push('⭐ _مادة في قائمة Always-Notify_');
-  L.push('', '🔗 افتح DULMS وسجّل فوراً!');
+
+  if (r.groups.length > 5) L.push(`\n_و ${r.groups.length - 5} Group إضافية..._`);
+
+  L.push('');
+  L.push(`🕐 ${new Date().toLocaleString('ar-EG', { timeZone: CONFIG.timezone })}`);
+
+  if (isAlwaysNotify) L.push('⭐ _مادة في قائمة Always-Notify_');
+
+  L.push('');
+  L.push('🔗 افتح DULMS وسجّل فوراً!');
+
   return { title: `🎉 ${code} فتح للتسجيل!`, body: L.join('\n') };
 }
 
-function fmtBaseline(watchable, prevState) {
-  const avail = watchable.filter(c => prevState.courses[c.id]?.available);
-  const L = [`📚 *${watchable.length}* كورس تحت المراقبة`, '', `✅ *${avail.length}* متاح حالياً:`, ''];
+function fmtBaseline(watchable, state) {
+  const avail = watchable.filter(c => state.courses[c.id]?.available);
+  const L = [
+    `📚 *${watchable.length}* كورس تحت المراقبة`,
+    '',
+    `✅ *${avail.length}* متاح حالياً:`,
+    '',
+  ];
+
   avail.slice(0, 15).forEach(c => L.push(`  • ${c.name}`));
   if (avail.length > 15) L.push(`  _...و ${avail.length - 15} أخرى_`);
-  L.push('', `🕐 ${new Date().toLocaleString('ar-EG', { timeZone: CONFIG.timezone })}`);
-  L.push('', `⭐ *Always-Notify:* ${USER_CONFIG.alwaysNotify.join(', ') || '(empty)'}`);
+
+  L.push('');
+  L.push(`🕐 ${new Date().toLocaleString('ar-EG', { timeZone: CONFIG.timezone })}`);
+  L.push('');
+  L.push(`⭐ *Always-Notify:* ${USER_CONFIG.alwaysNotify.join(', ') || '(empty)'}`);
   L.push(`🚫 *Never-Notify:* ${USER_CONFIG.neverNotify.join(', ') || '(empty)'}`);
-  L.push('', '_ستصلك رسالة فوراً عند فتح أي كورس جديد_');
+  L.push('');
+  L.push('_ستصلك رسالة فوراً عند فتح أي كورس جديد_');
+
   return { title: '👁️ DULMS Watcher v4.0 — بدأ المراقبة', body: L.join('\n') };
 }
 
@@ -392,17 +484,22 @@ async function runScan(browser) {
       reloginCount++;
     }
 
-    let watchable = [];
     const courses = await fetchAllCourses(page);
-    watchable = courses.filter(c => c.status === 'never');
+    const watchable = courses.filter(c => c.status === 'never');
     log.info(`Watching ${watchable.length}/${courses.length} courses`);
 
     if (!watchable.length) throw new Error('No watchable courses');
 
     log.step(isFirstRun ? 'FIRST RUN — baseline (no alerts)' : 'RESUMED');
-    if (USER_CONFIG.alwaysNotify.length) log.info(`⭐ Always-Notify: ${USER_CONFIG.alwaysNotify.join(', ')}`);
-    if (USER_CONFIG.neverNotify.length) log.info(`🚫 Never-Notify: ${USER_CONFIG.neverNotify.join(', ')}`);
-    if (USER_CONFIG.alreadyNotified.length) log.info(`📜 Already notified: ${USER_CONFIG.alreadyNotified.length} courses`);
+    if (USER_CONFIG.alwaysNotify.length) {
+      log.info(`Always-Notify: ${USER_CONFIG.alwaysNotify.join(', ')}`);
+    }
+    if (USER_CONFIG.neverNotify.length) {
+      log.info(`Never-Notify: ${USER_CONFIG.neverNotify.join(', ')}`);
+    }
+    if (USER_CONFIG.alreadyNotified.length) {
+      log.info(`Already notified: ${USER_CONFIG.alreadyNotified.length} courses`);
+    }
 
     const endTime = Date.now() + CONFIG.durationMin * 60 * 1000;
     let cycle = 0;
@@ -434,22 +531,22 @@ async function runScan(browser) {
           break;
         }
 
-        if (r.error) { log.warn(`${course.name} — ${r.error}`); continue; }
+        if (r.error) {
+          log.warn(`${course.name} — ${r.error}`);
+          continue;
+        }
 
         const key = course.id;
         const wasOpen = state.courses[key]?.available || false;
         const nowOpen = r.available;
 
         if (nowOpen && !wasOpen && !isFirstRun) {
-          // 🎯 فحص هل المفروض نبعت إشعار؟
           const decision = shouldNotify(course, r);
           if (decision.notify) {
             log.ok(`🎉 ${course.name} — OPEN (${r.count}) [${decision.reason}]`);
-            const msg = fmtOpening(course, r, decision.bypass ? 'alwaysNotify' : '');
+            const msg = fmtOpening(course, r, decision.bypass);
             await sendTelegram(msg.title, msg.body);
-            if (!decision.bypass) {
-              markAsNotified(course); // ضيفه للقائمة بعد الإرسال
-            }
+            if (!decision.bypass) markAsNotified(course);
           } else {
             log.skip(`🎉 ${course.name} — OPEN but ${decision.reason}`);
           }
@@ -459,14 +556,18 @@ async function runScan(browser) {
           log.info(`${course.name} — مقفول`);
         }
 
-        state.courses[key] = { available: nowOpen, count: r.count || 0, lastCheck: Date.now() };
+        state.courses[key] = {
+          available: nowOpen,
+          count: r.count || 0,
+          lastCheck: Date.now(),
+        };
 
         if (i < watchable.length - 1) await sleep(CONFIG.courseDelayMs);
       }
 
       saveState(state);
 
-      // ═══ Session died → re-login ═══
+      // Session died → re-login
       if (sessionDead) {
         if (reloginCount < CONFIG.maxRelogins) {
           log.warn(`Re-login #${reloginCount + 1}`);
@@ -483,7 +584,10 @@ async function runScan(browser) {
             log.err('Re-login failed:', e.message);
             break;
           }
-        } else { log.err('Max re-logins reached'); break; }
+        } else {
+          log.err('Max re-logins reached');
+          break;
+        }
       }
 
       const cycleElapsed = Date.now() - cycleStart;
@@ -511,15 +615,16 @@ async function runScan(browser) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  ENTRY
+//  ENTRY POINT
 // ═══════════════════════════════════════════════════════════════════════════
 (async () => {
   const t0 = Date.now();
+
   console.log('\n═══════════════════════════════════════════════');
   console.log('  🎯 DULMS Watcher v4.0 — Smart Dedup');
   console.log('═══════════════════════════════════════════════');
-  console.log(`  User:            ${CONFIG.username ? CONFIG.username.slice(0, 4) + '***' : '❌'}`);
-  console.log(`  Telegram:        ${CONFIG.tgToken ? '✓' : '❌'}`);
+  console.log(`  User:            ${CONFIG.username ? CONFIG.username.slice(0, 4) + '***' : '(not set)'}`);
+  console.log(`  Telegram:        ${CONFIG.tgToken ? '✓' : '(not set)'}`);
   console.log(`  Duration:        ${CONFIG.durationMin} min`);
   console.log(`  Fetch every:     ${CONFIG.fetchIntervalSec}s`);
   console.log(`  Cookie max age:  ${CONFIG.cookieMaxAgeMin} min`);
@@ -529,13 +634,14 @@ async function runScan(browser) {
   console.log('═══════════════════════════════════════════════\n');
 
   if (!CONFIG.username || !CONFIG.password) {
-    log.err('Missing credentials');
+    log.err('Missing DULMS_USERNAME or DULMS_PASSWORD');
     process.exit(1);
   }
 
   const browser = await createBrowser();
+
   const shutdown = async (sig) => {
-    log.warn(`Shutdown (${sig})`);
+    log.warn(`Received ${sig} — shutting down`);
     try { fs.writeFileSync(CONFIG.interruptFile, '1'); } catch (e) {}
     try { await browser.close(); } catch (e) {}
     process.exit(0);
@@ -543,9 +649,12 @@ async function runScan(browser) {
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-  try { await runScan(browser); }
-  catch (e) { process.exitCode = 1; }
-  finally {
+  try {
+    await runScan(browser);
+  } catch (e) {
+    log.err('Run failed:', e.message);
+    process.exitCode = 1;
+  } finally {
     await browser.close();
     console.log(`\n[MAIN] Done in ${((Date.now() - t0) / 1000).toFixed(1)}s\n`);
   }
