@@ -1,18 +1,14 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- *  DULMS Watcher v3.0 — Production Grade
+ *  DULMS Watcher v4.0 — Smart Dedup Edition
  *  ─────────────────────────────────────────────────────────────────────────
- *  Improvements over v2.0:
- *    ✓ Session persistence via storageState (Playwright best practice)
- *    ✓ Multi-selector fallback (robust to DULMS changes)
- *    ✓ Telegram rate-limit handling (30/sec) + retry on 429
- *    ✓ Persists state to cache + artifact backup
- *    ✓ First-run baseline (silent mode, no spam)
- *    ✓ Registered/passed courses filtering
- *    ✓ Graceful shutdown + interrupt support
- *    ✓ Detailed logging with context
- *    ✓ Auto re-login on session death (max 3 attempts)
- *    ✓ Timezone-aware timestamps (Africa/Cairo)
- *    ✓ Node.js 22 compatible
+ *  Core features:
+ *    ✓ Cookie-first: reuse session until it expires
+ *    ✓ Smart dedup: never notify same course twice (unless in alwaysNotify)
+ *    ✓ Always-notify list: specific courses that bypass dedup (e.g., ENG101)
+ *    ✓ Persistent state: tracks notified courses forever
+ *    ✓ Fast fetch: every 10 seconds
+ *    ✓ Auto re-login: only when session actually dies
+ *    ✓ Baseline on first run: silent, no spam
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 const { chromium } = require('playwright');
@@ -20,100 +16,97 @@ const fs = require('fs');
 const path = require('path');
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CONFIG
+//  🎯 إعدادات المستخدم — عدّل هنا فقط
 // ═══════════════════════════════════════════════════════════════════════════
+const USER_CONFIG = {
+  // المواد اللي عايز تستقبل إشعار عنها **دايماً** حتى لو اتبعتت قبل كده
+  // (bypass dedup)
+  alwaysNotify: [
+    'ENG',      // أي مادة فيها ENG
+    'ENGLISH',
+    // ضيف أي مادة تانية هنا
+  ],
+
+  // المواد اللي **مش عايز** إشعارات عنها خالص (silent ignore)
+  neverNotify: [
+    // مثال:
+    // 'CIV280',
+    // 'CIV141',
+  ],
+
+  // المواد اللي **اتبعتها قبل كده** — الكود هيملأها تلقائياً
+  // مش محتاج تعدلها يدوياً
+  alreadyNotified: [],
+};
+
 const CONFIG = {
   baseUrl:          'https://dulms.deltauniv.edu.eg',
   loginUrl:         'https://dulms.deltauniv.edu.eg/Login.aspx',
   coursesUrl:       'https://dulms.deltauniv.edu.eg/Registered/CoursesRegisteration',
+
   username:         process.env.DULMS_USERNAME || '',
   password:         process.env.DULMS_PASSWORD || '',
   tgToken:          process.env.TG_TOKEN || '',
   tgChatId:         process.env.TG_CHAT_ID || '',
   durationMin:      parseFloat(process.env.DURATION_MIN || '4.5'),
-  checkIntervalSec: parseInt(process.env.CHECK_INTERVAL || '30', 10),
+
+  fetchIntervalSec: 10,      // فحص كل 10 ثواني
+  courseDelayMs:    500,     // تأخير بين الكورسات
+  cookieMaxAgeMin:  15,      // صلاحية الكوكيز
+  maxRelogins:      5,
+
   stateFile:        path.join(process.cwd(), '.dulms-state.json'),
   sessionFile:      path.join(process.cwd(), '.dulms-session.json'),
+  sessionMetaFile:  path.join(process.cwd(), '.dulms-session-meta.json'),
   interruptFile:    path.join(process.cwd(), '.dulms-interrupt'),
   timezone:         'Africa/Cairo',
-  maxRelogins:      3,
   dryRun:           process.argv.includes('--dry-run'),
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  LOGGER (with timestamps)
+//  LOGGER
 // ═══════════════════════════════════════════════════════════════════════════
 const ts = () => new Date().toISOString().slice(11, 19);
 const log = {
-  info:  (...a) => console.log(`[${ts()}] [INFO]`,  ...a),
-  ok:    (...a) => console.log(`[${ts()}] [ OK ]`,  ...a),
+  info:  (...a) => console.log(`[${ts()}] [INFO]`, ...a),
+  ok:    (...a) => console.log(`[${ts()}] [ OK ]`, ...a),
   warn:  (...a) => console.warn(`[${ts()}] [WARN]`, ...a),
   err:   (...a) => console.error(`[${ts()}] [FAIL]`, ...a),
-  tg:    (...a) => console.log(`[${ts()}] [ TG ]`,  ...a),
+  tg:    (...a) => console.log(`[${ts()}] [ TG ]`, ...a),
+  skip:  (...a) => console.log(`[${ts()}] [SKIP]`, ...a),
   step:  (...a) => console.log(`\n[${ts()}] ━━━`, ...a, '━━━'),
 };
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 // ═══════════════════════════════════════════════════════════════════════════
-//  TELEGRAM (with rate-limit handling + retry)
+//  TELEGRAM
 // ═══════════════════════════════════════════════════════════════════════════
-let lastTelegramCall = 0;
-const TG_MIN_INTERVAL = 40; // ms — يضمن أقل من 30 msg/sec
-
-async function sendTelegram(title, body, attempt = 1) {
-  if (!CONFIG.tgToken || !CONFIG.tgChatId) {
-    log.warn('Telegram not configured');
-    return false;
-  }
-  if (CONFIG.dryRun) {
-    log.info('[DRY-RUN] Telegram:', title);
-    return true;
-  }
-
-  // Rate limiting (30 msg/sec = 33ms بين كل طلب)
-  const now = Date.now();
-  const wait = Math.max(0, TG_MIN_INTERVAL - (now - lastTelegramCall));
-  if (wait > 0) await new Promise(r => setTimeout(r, wait));
-  lastTelegramCall = Date.now();
-
+let lastTgCall = 0;
+async function sendTelegram(title, body) {
+  if (!CONFIG.tgToken || !CONFIG.tgChatId) return false;
+  if (CONFIG.dryRun) { log.info('[DRY]', title); return true; }
+  const wait = Math.max(0, 40 - (Date.now() - lastTgCall));
+  if (wait > 0) await sleep(wait);
+  lastTgCall = Date.now();
   const text = (title ? `🔔 *${title}*\n` : '') + (body || '');
-  const url = `https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`;
-
   try {
-    const res = await fetch(url, {
+    const res = await fetch(`https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: CONFIG.tgChatId,
-        text,
-        parse_mode: 'Markdown',
-        disable_web_page_preview: true,
-      }),
+      body: JSON.stringify({ chat_id: CONFIG.tgChatId, text, parse_mode: 'Markdown', disable_web_page_preview: true }),
     });
     const data = await res.json();
-
     if (data.ok) { log.tg('✓ Sent'); return true; }
-
-    // Rate limit reached
     if (data.error_code === 429) {
-      const retryAfter = data.parameters?.retry_after || 30;
-      log.warn(`Telegram rate limited. Retry after ${retryAfter}s`);
-      if (attempt < 3) {
-        await new Promise(r => setTimeout(r, (retryAfter + 2) * 1000));
-        return sendTelegram(title, body, attempt + 1);
-      }
+      const ra = data.parameters?.retry_after || 30;
+      log.warn(`TG rate limited, wait ${ra}s`);
+      await sleep((ra + 2) * 1000);
+      return sendTelegram(title, body);
     }
-
-    log.err('Telegram error:', data.description);
+    log.err('TG:', data.description);
     return false;
-  } catch (e) {
-    if (attempt < 3) {
-      log.warn(`Telegram retry ${attempt}/3 in 2s...`);
-      await new Promise(r => setTimeout(r, 2000));
-      return sendTelegram(title, body, attempt + 1);
-    }
-    log.err('Telegram failed:', e.message);
-    return false;
-  }
+  } catch (e) { log.err('TG fetch:', e.message); return false; }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -122,437 +115,395 @@ async function sendTelegram(title, body, attempt = 1) {
 function loadState() {
   try {
     if (fs.existsSync(CONFIG.stateFile)) {
-      const state = JSON.parse(fs.readFileSync(CONFIG.stateFile, 'utf8'));
-      const n = Object.keys(state).filter(k => !k.startsWith('_')).length;
-      log.info(`State loaded: ${n} courses, last update: ${state._lastUpdate || 'never'}`);
-      return state;
+      const s = JSON.parse(fs.readFileSync(CONFIG.stateFile, 'utf8'));
+      // دمج قائمة alreadyNotified مع USER_CONFIG
+      if (s._alreadyNotified && Array.isArray(s._alreadyNotified)) {
+        USER_CONFIG.alreadyNotified = s._alreadyNotified;
+      }
+      return s;
     }
   } catch (e) { log.warn('State read failed:', e.message); }
-  return {};
+  return { _lastUpdate: 0, _alreadyNotified: [], courses: {} };
 }
 
 function saveState(state) {
   try {
     state._lastUpdate = new Date().toISOString();
+    state._alreadyNotified = USER_CONFIG.alreadyNotified;
     fs.writeFileSync(CONFIG.stateFile, JSON.stringify(state, null, 2));
-    const n = Object.keys(state).filter(k => !k.startsWith('_')).length;
-    log.ok(`State saved (${n} courses)`);
   } catch (e) { log.warn('State write failed:', e.message); }
 }
 
+// ═══ Session meta (cookie age) ═══
+function loadSessionMeta() {
+  try { if (fs.existsSync(CONFIG.sessionMetaFile)) return JSON.parse(fs.readFileSync(CONFIG.sessionMetaFile, 'utf8')); }
+  catch (e) {}
+  return { savedAt: 0 };
+}
+function saveSessionMeta() {
+  try { fs.writeFileSync(CONFIG.sessionMetaFile, JSON.stringify({ savedAt: Date.now() })); }
+  catch (e) {}
+}
+function sessionAgeMinutes() {
+  const m = loadSessionMeta();
+  return m.savedAt ? (Date.now() - m.savedAt) / 60000 : Infinity;
+}
 function cleanupSession() {
   try { if (fs.existsSync(CONFIG.sessionFile)) fs.unlinkSync(CONFIG.sessionFile); } catch (e) {}
+  try { if (fs.existsSync(CONFIG.sessionMetaFile)) fs.unlinkSync(CONFIG.sessionMetaFile); } catch (e) {}
+}
+async function saveSession(ctx) {
+  try { await ctx.storageState({ path: CONFIG.sessionFile }); saveSessionMeta(); }
+  catch (e) {}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  BROWSER HELPERS
+//  🎯 SMART NOTIFICATION LOGIC — قلب النظام
+// ═══════════════════════════════════════════════════════════════════════════
+function shouldNotify(course, result) {
+  const name = course.name.toUpperCase();
+  const code = course.name.split(' - ')[0].toUpperCase();
+
+  // 1. Never-notify list (highest priority)
+  for (const skip of USER_CONFIG.neverNotify) {
+    if (name.includes(skip.toUpperCase())) {
+      return { notify: false, reason: 'in neverNotify list' };
+    }
+  }
+
+  // 2. Always-notify list (bypass dedup)
+  for (const always of USER_CONFIG.alwaysNotify) {
+    if (name.includes(always.toUpperCase())) {
+      return { notify: true, reason: 'in alwaysNotify list (bypass dedup)', bypass: true };
+    }
+  }
+
+  // 3. Dedup: has this course been notified before?
+  const wasNotified = USER_CONFIG.alreadyNotified.includes(code);
+  if (wasNotified) {
+    return { notify: false, reason: 'already notified before (dedup)' };
+  }
+
+  // 4. Not notified before → notify
+  return { notify: true, reason: 'first time opening' };
+}
+
+function markAsNotified(course) {
+  const code = course.name.split(' - ')[0].trim();
+  if (!USER_CONFIG.alreadyNotified.includes(code)) {
+    USER_CONFIG.alreadyNotified.push(code);
+    log.info(`Added "${code}" to notified list`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  BROWSER
 // ═══════════════════════════════════════════════════════════════════════════
 async function createBrowser() {
   return await chromium.launch({
     headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled',
-      '--disable-gpu',
-      '--no-zygote',
-      '--single-process', // يستخدم ذاكرة أقل
-    ],
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+           '--disable-blink-features=AutomationControlled', '--disable-gpu'],
   });
 }
 
-async function createContext(browser, useStoredSession = true) {
+async function createPage(browser, useCookies = true) {
   const opts = {
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     viewport: { width: 1280, height: 720 },
     locale: 'en-US',
     timezoneId: CONFIG.timezone,
   };
-
-  // محاولة استخدام الجلسة المحفوظة (Playwright best practice)
-  if (useStoredSession && fs.existsSync(CONFIG.sessionFile)) {
+  let cookiesLoaded = false;
+  if (useCookies && fs.existsSync(CONFIG.sessionFile)) {
     try {
       opts.storageState = CONFIG.sessionFile;
-      log.info('Using stored session');
-    } catch (e) {
-      log.warn('Session file corrupt, starting fresh');
-    }
+      cookiesLoaded = true;
+      log.info(`Cookies loaded (age: ${sessionAgeMinutes().toFixed(1)} min)`);
+    } catch (e) {}
   }
-
   const context = await browser.newContext(opts);
   const page = await context.newPage();
-
-  // حجب الصور والـ fonts لتسريع التحميل
   await page.route('**/*', (route) => {
     const t = route.request().resourceType();
     if (['image', 'font', 'media', 'stylesheet'].includes(t)) return route.abort();
     return route.continue();
   });
-
-  return { context, page };
-}
-
-async function saveSession(context) {
-  try {
-    await context.storageState({ path: CONFIG.sessionFile });
-    log.info('Session saved to disk');
-  } catch (e) {
-    log.warn('Session save failed:', e.message);
-  }
+  return { context, page, cookiesLoaded };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  LOGIN (with multi-selector fallback)
+//  LOGIN
 // ═══════════════════════════════════════════════════════════════════════════
-async function findFirstMatch(page, selectors, timeout = 5000) {
-  for (const sel of selectors) {
+async function findFirst(page, sels) {
+  for (const s of sels) {
     try {
-      const loc = page.locator(sel).first();
-      if (await loc.count() > 0) {
-        await loc.waitFor({ state: 'visible', timeout });
-        return sel;
-      }
-    } catch (e) { /* continue */ }
+      const l = page.locator(s).first();
+      if (await l.count() > 0) { await l.waitFor({ state: 'visible', timeout: 5000 }); return s; }
+    } catch (e) {}
   }
   return null;
 }
 
 async function loginToDulms(page) {
-  log.info('Logging in...');
+  log.info('Login (fresh)...');
   await page.goto(CONFIG.loginUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-  const userSel = await findFirstMatch(page, [
-    'input#LoginId', 'input[name="LoginId"]', 'input#txtUser',
-    'input[name="Username"]', 'input[type="text"]'
-  ]);
-  const passSel = await findFirstMatch(page, [
-    'input#Password', 'input[name="Password"]',
-    'input#txtPassword', 'input[type="password"]'
-  ]);
-  const btnSel = await findFirstMatch(page, [
-    'input[type="submit"]', 'button[type="submit"]',
-    'button#btnLogin', 'button.login-btn'
-  ]);
-
-  if (!userSel || !passSel || !btnSel) {
-    throw new Error(`Login fields not found (user=${userSel}, pass=${passSel}, btn=${btnSel})`);
-  }
-
-  log.info(`Fields: user="${userSel}", pass="${passSel}", btn="${btnSel}"`);
-
-  await page.fill(userSel, CONFIG.username);
-  await page.fill(passSel, CONFIG.password);
+  const u = await findFirst(page, ['input#LoginId', 'input[name="LoginId"]', 'input#txtUser', 'input[type="text"]']);
+  const p = await findFirst(page, ['input#Password', 'input[name="Password"]', 'input[type="password"]']);
+  const b = await findFirst(page, ['input[type="submit"]', 'button[type="submit"]']);
+  if (!u || !p || !b) throw new Error('Login fields not found');
+  await page.fill(u, CONFIG.username);
+  await page.fill(p, CONFIG.password);
   await Promise.all([
     page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {}),
-    page.click(btnSel),
+    page.click(b),
   ]);
+  if (page.url().includes('/Login.aspx')) throw new Error('Login failed');
+  log.ok('Logged in');
+}
 
-  const finalUrl = page.url();
-  if (finalUrl.includes('/Login.aspx') || finalUrl.includes('error')) {
-    throw new Error(`Login failed — still at ${finalUrl}`);
-  }
-  log.ok(`Logged in → ${finalUrl}`);
+async function validateCookies(page) {
+  try {
+    await page.goto(CONFIG.coursesUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+    if (page.url().includes('/Login.aspx') || page.url().includes('/Account/')) {
+      log.warn('Cookies expired');
+      return false;
+    }
+    const cnt = await page.locator('article.course-item').count();
+    if (cnt === 0) { log.warn('No courses in page'); return false; }
+    log.ok(`Cookies valid (${cnt} courses)`);
+    return true;
+  } catch (e) { log.warn('Cookie validation failed:', e.message); return false; }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  FETCH COURSES
+//  COURSES
 // ═══════════════════════════════════════════════════════════════════════════
 async function fetchAllCourses(page) {
   await page.goto(CONFIG.coursesUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
-
-  try {
-    await page.waitForSelector('article.course-item', { timeout: 20000 });
-  } catch (e) {
-    log.warn('No course items in DOM');
-    return [];
-  }
-
-  const courses = await page.evaluate(() => {
-    const items = Array.from(document.querySelectorAll('article.course-item[id]'));
-    return items.map(el => {
-      const nameEl = el.querySelector('.course-name');
-      let status = 'never';
-      if      (el.classList.contains('registered')) status = 'registered';
-      else if (el.classList.contains('passed'))     status = 'passed';
-      else if (el.classList.contains('failed'))     status = 'failed';
-      else if (el.classList.contains('withdaw'))    status = 'withdrawn';
-      return {
-        id: el.id,
-        name: nameEl ? nameEl.innerText.trim() : '',
-        status,
-      };
+  try { await page.waitForSelector('article.course-item', { timeout: 20000 }); }
+  catch (e) { return []; }
+  return await page.evaluate(() => {
+    return Array.from(document.querySelectorAll('article.course-item[id]')).map(el => {
+      const n = el.querySelector('.course-name');
+      let st = 'never';
+      if      (el.classList.contains('registered')) st = 'registered';
+      else if (el.classList.contains('passed'))     st = 'passed';
+      else if (el.classList.contains('failed'))     st = 'failed';
+      else if (el.classList.contains('withdaw'))    st = 'withdrawn';
+      return { id: el.id, name: n ? n.innerText.trim() : '', status: st };
     }).filter(c => c.name && c.id);
   });
-
-  log.info(`Found ${courses.length} courses`);
-  return courses;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  CHECK COURSE SCHEDULE
-// ═══════════════════════════════════════════════════════════════════════════
-async function checkCourseSchedule(page, courseId) {
+async function checkCourse(page, id) {
   try {
-    const result = await page.evaluate(async (cid) => {
+    const r = await page.evaluate(async (cid) => {
       const res = await fetch('/Registered/GetCourseSchedual?CourseId=' + encodeURIComponent(cid));
       if (!res.ok) return { error: 'http_' + res.status };
       const raw = (await res.text()).trim();
       if (raw === '-1' || raw === '""' || raw.charAt(0) === '<') return { sessionDead: true };
       if (raw === '' || raw === 'null' || raw === '[]') return { empty: true };
-      try { return { data: JSON.parse(raw) }; }
-      catch (e) { return { error: 'parse' }; }
-    }, courseId);
-
-    if (result.sessionDead) return { sessionDead: true };
-    if (result.empty || result.error) return { available: false, count: 0 };
-    if (!Array.isArray(result.data)) return { available: false, count: 0 };
-
-    const groupsMap = {};
-    for (const item of result.data) {
+      try { return { data: JSON.parse(raw) }; } catch (e) { return { error: 'parse' }; }
+    }, id);
+    if (r.sessionDead) return { sessionDead: true };
+    if (r.empty || r.error || !Array.isArray(r.data)) return { available: false, count: 0 };
+    const groups = {};
+    for (const item of r.data) {
       if (item.Type !== 'Group') continue;
       const gid = item.GroupId;
-      if (!groupsMap[gid]) {
-        groupsMap[gid] = {
-          name: item.GroupName,
-          blocked: !!item.IsBlocked,
+      if (!groups[gid]) {
+        groups[gid] = {
+          name: item.GroupName, blocked: !!item.IsBlocked,
           total: parseInt(item.StudentsCount, 10) || 0,
           registered: parseInt(item.RegisteredCount, 10) || 0,
           slots: [],
         };
       }
-      groupsMap[gid].slots.push({
-        day: item.DayWeekName,
-        time: item.Time,
-        hall: item.ClassRoomName,
-      });
+      groups[gid].slots.push({ day: item.DayWeekName, time: item.Time, hall: item.ClassRoomName });
     }
-
-    const available = Object.values(groupsMap)
+    const available = Object.values(groups)
       .filter(g => !g.blocked && (g.total - g.registered) > 0)
-      .map(g => ({
-        name: g.name,
-        open: g.total - g.registered,
-        total: g.total,
-        firstSlot: g.slots[0] || null,
-      }))
+      .map(g => ({ name: g.name, open: g.total - g.registered, total: g.total, firstSlot: g.slots[0] || null }))
       .sort((a, b) => b.open - a.open);
-
     return { available: available.length > 0, count: available.length, groups: available };
-  } catch (e) {
-    return { error: e.message };
-  }
+  } catch (e) { return { error: e.message }; }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  TELEGRAM MESSAGE FORMATTERS
+//  MESSAGE FORMATTERS
 // ═══════════════════════════════════════════════════════════════════════════
-function formatOpeningMessage(course, result) {
-  const courseCode = course.name.split(' - ')[0];
-  const lines = [];
-
-  lines.push(`✅ *${result.count}* Group(s) متاحة للتسجيل`);
-  lines.push('');
-
-  result.groups.slice(0, 5).forEach((g, i) => {
-    lines.push(`*${i + 1}. ${g.name}*   💺 ${g.open}/${g.total}`);
+function fmtOpening(course, r, reason) {
+  const code = course.name.split(' - ')[0];
+  const L = [`✅ *${r.count}* Group(s) متاحة`, ''];
+  r.groups.slice(0, 5).forEach((g, i) => {
+    L.push(`*${i + 1}. ${g.name}*   💺 ${g.open}/${g.total}`);
     if (g.firstSlot) {
-      lines.push(`   📅 ${g.firstSlot.day} | ⏰ ${g.firstSlot.time}`);
-      if (g.firstSlot.hall) lines.push(`   🏛️ ${g.firstSlot.hall}`);
+      L.push(`   📅 ${g.firstSlot.day} | ⏰ ${g.firstSlot.time}`);
+      if (g.firstSlot.hall) L.push(`   🏛️ ${g.firstSlot.hall}`);
     }
-    if (i < Math.min(4, result.groups.length - 1)) lines.push('');
+    if (i < Math.min(4, r.groups.length - 1)) L.push('');
   });
-
-  if (result.groups.length > 5) {
-    lines.push(`\n_و ${result.groups.length - 5} Group إضافية..._`);
-  }
-
-  lines.push('');
-  lines.push(`🕐 ${new Date().toLocaleString('ar-EG', { timeZone: CONFIG.timezone })}`);
-  lines.push('');
-  lines.push('🔗 افتح DULMS وسجّل فوراً!');
-
-  return {
-    title: `🎉 ${courseCode} فتح للتسجيل!`,
-    body: lines.join('\n'),
-  };
+  if (r.groups.length > 5) L.push(`\n_و ${r.groups.length - 5} أخرى_`);
+  L.push('', `🕐 ${new Date().toLocaleString('ar-EG', { timeZone: CONFIG.timezone })}`);
+  if (reason === 'alwaysNotify') L.push('⭐ _مادة في قائمة Always-Notify_');
+  L.push('', '🔗 افتح DULMS وسجّل فوراً!');
+  return { title: `🎉 ${code} فتح للتسجيل!`, body: L.join('\n') };
 }
 
-function formatBaselineMessage(watchable, prevState) {
-  const avail = watchable.filter(c => prevState[c.id]?.available);
-  const lines = [];
-
-  lines.push(`📚 *${watchable.length}* كورس تحت المراقبة`);
-  lines.push('');
-  lines.push(`✅ *${avail.length}* متاح حالياً:`);
-  lines.push('');
-  avail.slice(0, 15).forEach(c => lines.push(`  • ${c.name}`));
-  if (avail.length > 15) lines.push(`  _...و ${avail.length - 15} أخرى_`);
-
-  lines.push('');
-  lines.push(`🕐 ${new Date().toLocaleString('ar-EG', { timeZone: CONFIG.timezone })}`);
-  lines.push('');
-  lines.push('_ستصلك رسالة فوراً عند فتح أي كورس جديد_');
-
-  return {
-    title: '👁️ DULMS Watcher — بدأ المراقبة',
-    body: lines.join('\n'),
-  };
+function fmtBaseline(watchable, prevState) {
+  const avail = watchable.filter(c => prevState.courses[c.id]?.available);
+  const L = [`📚 *${watchable.length}* كورس تحت المراقبة`, '', `✅ *${avail.length}* متاح حالياً:`, ''];
+  avail.slice(0, 15).forEach(c => L.push(`  • ${c.name}`));
+  if (avail.length > 15) L.push(`  _...و ${avail.length - 15} أخرى_`);
+  L.push('', `🕐 ${new Date().toLocaleString('ar-EG', { timeZone: CONFIG.timezone })}`);
+  L.push('', `⭐ *Always-Notify:* ${USER_CONFIG.alwaysNotify.join(', ') || '(empty)'}`);
+  L.push(`🚫 *Never-Notify:* ${USER_CONFIG.neverNotify.join(', ') || '(empty)'}`);
+  L.push('', '_ستصلك رسالة فوراً عند فتح أي كورس جديد_');
+  return { title: '👁️ DULMS Watcher v4.0 — بدأ المراقبة', body: L.join('\n') };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  MAIN SCAN LOOP
+//  MAIN SCAN
 // ═══════════════════════════════════════════════════════════════════════════
 async function runScan(browser) {
-  let { context, page } = await createContext(browser, true);
+  let { context, page, cookiesLoaded } = await createPage(browser, true);
+  let hasValidSession = false;
+
+  if (cookiesLoaded && sessionAgeMinutes() < CONFIG.cookieMaxAgeMin) {
+    hasValidSession = await validateCookies(page);
+  } else if (cookiesLoaded) {
+    log.warn(`Cookies too old (${sessionAgeMinutes().toFixed(1)} min)`);
+    cleanupSession();
+    await context.close();
+    ({ context, page } = await createPage(browser, false));
+  }
+
+  const state = loadState();
+  const isFirstRun = !state._lastUpdate;
+  let reloginCount = 0;
 
   try {
-    // ─── 1. Login ───
-    let loggedIn = false;
-
-    // جرّب الجلسة المحفوظة أولاً
-    if (fs.existsSync(CONFIG.sessionFile)) {
-      try {
-        await page.goto(CONFIG.coursesUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-        const url = page.url();
-        if (url.includes('/Login.aspx') || url.includes('/Account/')) {
-          log.warn('Stored session expired — re-login');
-          cleanupSession();
-        } else {
-          log.ok('Reused stored session ✓');
-          loggedIn = true;
-        }
-      } catch (e) {
-        log.warn('Session check failed:', e.message);
-      }
-    }
-
-    if (!loggedIn) {
+    if (!hasValidSession) {
       await loginToDulms(page);
       await saveSession(context);
+      reloginCount++;
     }
 
-    // ─── 2. Fetch courses ───
+    let watchable = [];
     const courses = await fetchAllCourses(page);
-    if (!courses.length) throw new Error('No courses found');
+    watchable = courses.filter(c => c.status === 'never');
+    log.info(`Watching ${watchable.length}/${courses.length} courses`);
 
-    // ─── 3. Filter ───
-    const watchable = courses.filter(c => c.status === 'never');
-    log.info(`Watching ${watchable.length}/${courses.length} courses (skip registered/passed/failed/withdrawn)`);
+    if (!watchable.length) throw new Error('No watchable courses');
 
-    if (!watchable.length) {
-      log.warn('No watchable courses');
-      return;
-    }
+    log.step(isFirstRun ? 'FIRST RUN — baseline (no alerts)' : 'RESUMED');
+    if (USER_CONFIG.alwaysNotify.length) log.info(`⭐ Always-Notify: ${USER_CONFIG.alwaysNotify.join(', ')}`);
+    if (USER_CONFIG.neverNotify.length) log.info(`🚫 Never-Notify: ${USER_CONFIG.neverNotify.join(', ')}`);
+    if (USER_CONFIG.alreadyNotified.length) log.info(`📜 Already notified: ${USER_CONFIG.alreadyNotified.length} courses`);
 
-    // ─── 4. State ───
-    const prevState = loadState();
-    const isFirstRun = !prevState._lastUpdate;
-    log.step(isFirstRun ? 'FIRST RUN — baseline mode' : 'RESUMED — will alert on new openings');
-
-    // ─── 5. Scan loop ───
     const endTime = Date.now() + CONFIG.durationMin * 60 * 1000;
-    let round = 0;
-    let reLoginCount = 0;
+    let cycle = 0;
 
     while (Date.now() < endTime) {
-      // Interrupt check
       if (fs.existsSync(CONFIG.interruptFile)) {
-        log.warn('Interrupt — stopping');
+        log.warn('Interrupt');
         try { fs.unlinkSync(CONFIG.interruptFile); } catch (e) {}
         break;
       }
 
-      round++;
+      const cycleStart = Date.now();
+      cycle++;
       const elapsed = ((Date.now() - (endTime - CONFIG.durationMin * 60 * 1000)) / 1000).toFixed(0);
-      const remaining = ((endTime - Date.now()) / 1000).toFixed(0);
-      log.step(`Round #${round} | ${elapsed}s elapsed | ${remaining}s remaining`);
+      const left = ((endTime - Date.now()) / 1000).toFixed(0);
+      log.step(`Cycle #${cycle} | ${elapsed}s | ${left}s left | cookie: ${sessionAgeMinutes().toFixed(0)}min`);
 
       let sessionDead = false;
 
-      for (const course of watchable) {
+      for (let i = 0; i < watchable.length; i++) {
         if (Date.now() >= endTime) break;
 
-        const result = await checkCourseSchedule(page, course.id);
+        const course = watchable[i];
+        const r = await checkCourse(page, course.id);
 
-        if (result.sessionDead) {
-          log.warn('Session died');
-          if (reLoginCount < CONFIG.maxRelogins) {
-            reLoginCount++;
-            try {
-              cleanupSession();
-              await loginToDulms(page);
-              await saveSession(context);
-              await page.goto(CONFIG.coursesUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-              log.ok(`Re-login #${reLoginCount} successful`);
-              sessionDead = false;
-              break; // restart this round
-            } catch (e) {
-              log.err('Re-login failed:', e.message);
-              sessionDead = true;
-            }
-          } else {
-            log.err('Max re-logins reached');
-            sessionDead = true;
-          }
+        if (r.sessionDead) {
+          log.warn(`Session died at [${i + 1}/${watchable.length}] ${course.name}`);
+          sessionDead = true;
           break;
         }
 
-        if (result.error) {
-          log.warn(`${course.name} — ${result.error}`);
-          continue;
-        }
+        if (r.error) { log.warn(`${course.name} — ${r.error}`); continue; }
 
         const key = course.id;
-        const wasOpen = prevState[key]?.available || false;
-        const nowOpen = result.available;
+        const wasOpen = state.courses[key]?.available || false;
+        const nowOpen = r.available;
 
         if (nowOpen && !wasOpen && !isFirstRun) {
-          log.ok(`🎉 ${course.name} — OPEN! (${result.count} groups)`);
-          const msg = formatOpeningMessage(course, result);
-          await sendTelegram(msg.title, msg.body);
+          // 🎯 فحص هل المفروض نبعت إشعار؟
+          const decision = shouldNotify(course, r);
+          if (decision.notify) {
+            log.ok(`🎉 ${course.name} — OPEN (${r.count}) [${decision.reason}]`);
+            const msg = fmtOpening(course, r, decision.bypass ? 'alwaysNotify' : '');
+            await sendTelegram(msg.title, msg.body);
+            if (!decision.bypass) {
+              markAsNotified(course); // ضيفه للقائمة بعد الإرسال
+            }
+          } else {
+            log.skip(`🎉 ${course.name} — OPEN but ${decision.reason}`);
+          }
         } else if (nowOpen) {
-          log.ok(`${course.name} — متاح (${result.count})`);
+          log.ok(`${course.name} — متاح (${r.count})`);
         } else {
           log.info(`${course.name} — مقفول`);
         }
 
-        prevState[key] = {
-          available: nowOpen,
-          count: result.count || 0,
-          lastCheck: Date.now(),
-        };
+        state.courses[key] = { available: nowOpen, count: r.count || 0, lastCheck: Date.now() };
 
-        await new Promise(r => setTimeout(r, 800)); // تأخير بين الكورسات
+        if (i < watchable.length - 1) await sleep(CONFIG.courseDelayMs);
       }
 
-      if (sessionDead) log.warn('Skipping rest of round');
+      saveState(state);
 
-      saveState(prevState);
+      // ═══ Session died → re-login ═══
+      if (sessionDead) {
+        if (reloginCount < CONFIG.maxRelogins) {
+          log.warn(`Re-login #${reloginCount + 1}`);
+          try {
+            cleanupSession();
+            await context.close();
+            ({ context, page } = await createPage(browser, false));
+            await loginToDulms(page);
+            await saveSession(context);
+            reloginCount++;
+            log.ok('Re-login ✓');
+            continue;
+          } catch (e) {
+            log.err('Re-login failed:', e.message);
+            break;
+          }
+        } else { log.err('Max re-logins reached'); break; }
+      }
 
-      const remainingMs = endTime - Date.now();
-      if (remainingMs > CONFIG.checkIntervalSec * 1000) {
-        log.info(`Sleeping ${CONFIG.checkIntervalSec}s...`);
-        await new Promise(r => setTimeout(r, CONFIG.checkIntervalSec * 1000));
+      const cycleElapsed = Date.now() - cycleStart;
+      const sleepTime = Math.max(0, CONFIG.fetchIntervalSec * 1000 - cycleElapsed);
+      if (sleepTime > 0) {
+        log.info(`Cycle: ${(cycleElapsed / 1000).toFixed(1)}s | sleeping ${(sleepTime / 1000).toFixed(1)}s`);
+        await sleep(sleepTime);
       }
     }
 
-    // ─── 6. Baseline notification ───
     if (isFirstRun) {
-      const msg = formatBaselineMessage(watchable, prevState);
+      const msg = fmtBaseline(watchable, state);
       await sendTelegram(msg.title, msg.body);
     }
 
-    log.step(`SCAN COMPLETE — ${round} rounds`);
+    log.step(`SCAN COMPLETE — ${cycle} cycles, ${reloginCount} logins`);
 
   } catch (e) {
     log.err('FATAL:', e.message);
-    await sendTelegram(
-      '⚠️ DULMS Watcher Error',
-      `\`${e.message}\`\n\n_سيُعاد التشغيل تلقائياً_`
-    );
+    await sendTelegram('⚠️ DULMS Watcher Error', `\`${e.message}\``);
     throw e;
   } finally {
     await context.close();
@@ -560,48 +511,42 @@ async function runScan(browser) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  ENTRY POINT
+//  ENTRY
 // ═══════════════════════════════════════════════════════════════════════════
 (async () => {
   const t0 = Date.now();
-
   console.log('\n═══════════════════════════════════════════════');
-  console.log('  👁️  DULMS Watcher v3.0 — Production Grade');
+  console.log('  🎯 DULMS Watcher v4.0 — Smart Dedup');
   console.log('═══════════════════════════════════════════════');
-  console.log(`  User:       ${CONFIG.username ? CONFIG.username.slice(0, 4) + '***' : '❌ MISSING'}`);
-  console.log(`  Password:   ${CONFIG.password ? '✓ set' : '❌ MISSING'}`);
-  console.log(`  Telegram:   ${CONFIG.tgToken ? '✓' : '❌ MISSING'}`);
-  console.log(`  Duration:   ${CONFIG.durationMin} minutes`);
-  console.log(`  Interval:   ${CONFIG.checkIntervalSec}s`);
-  console.log(`  Dry run:    ${CONFIG.dryRun}`);
-  console.log(`  Node:       ${process.version}`);
+  console.log(`  User:            ${CONFIG.username ? CONFIG.username.slice(0, 4) + '***' : '❌'}`);
+  console.log(`  Telegram:        ${CONFIG.tgToken ? '✓' : '❌'}`);
+  console.log(`  Duration:        ${CONFIG.durationMin} min`);
+  console.log(`  Fetch every:     ${CONFIG.fetchIntervalSec}s`);
+  console.log(`  Cookie max age:  ${CONFIG.cookieMaxAgeMin} min`);
+  console.log(`  Always-notify:   ${USER_CONFIG.alwaysNotify.join(', ') || '(none)'}`);
+  console.log(`  Never-notify:    ${USER_CONFIG.neverNotify.join(', ') || '(none)'}`);
+  console.log(`  Node:            ${process.version}`);
   console.log('═══════════════════════════════════════════════\n');
 
   if (!CONFIG.username || !CONFIG.password) {
-    log.err('Missing DULMS_USERNAME or DULMS_PASSWORD');
+    log.err('Missing credentials');
     process.exit(1);
   }
 
   const browser = await createBrowser();
-
-  // Graceful shutdown
   const shutdown = async (sig) => {
-    log.warn(`Received ${sig} — shutting down`);
+    log.warn(`Shutdown (${sig})`);
     try { fs.writeFileSync(CONFIG.interruptFile, '1'); } catch (e) {}
     try { await browser.close(); } catch (e) {}
     process.exit(0);
   };
-  process.on('SIGINT',  () => shutdown('SIGINT'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-  try {
-    await runScan(browser);
-  } catch (e) {
-    log.err('Run failed:', e.message);
-    process.exitCode = 1;
-  } finally {
+  try { await runScan(browser); }
+  catch (e) { process.exitCode = 1; }
+  finally {
     await browser.close();
-    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-    console.log(`\n[MAIN] Done in ${elapsed}s\n`);
+    console.log(`\n[MAIN] Done in ${((Date.now() - t0) / 1000).toFixed(1)}s\n`);
   }
 })();
