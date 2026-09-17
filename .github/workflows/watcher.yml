@@ -21,14 +21,18 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Restore state from cache
+      - name: Restore state and session
         uses: actions/cache/restore@v4
         with:
-          path: .dulms-state.json
-          key: dulms-state-v3
+          path: |
+            .dulms-state.json
+            .dulms-session.json
+            .dulms-session-meta.json
+          key: dulms-v4
           restore-keys: |
+            dulms-v4
+            dulms-v33
             dulms-state-v3
-            dulms-state-v2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -48,22 +52,35 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           DURATION_MIN: '4.5'
-          CHECK_INTERVAL: '30'
         run: node watch.js
 
-      - name: Save state to cache
+      - name: Save state and session
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: .dulms-state.json
-          key: dulms-state-v3
+          path: |
+            .dulms-state.json
+            .dulms-session.json
+            .dulms-session-meta.json
+          key: dulms-v4
 
-      - name: Upload state as artifact
+      - name: Upload state as artifact backup
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dulms-state
+          name: dulms-state-backup
           path: .dulms-state.json
           retention-days: 30
           overwrite: true
+          if-no-files-found: ignore
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs
+          path: |
+            .dulms-state.json
+            .dulms-session-meta.json
+          retention-days: 3
           if-no-files-found: ignore
