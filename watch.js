@@ -278,3 +278,885 @@ async function registerBotCommands() {
     log.ok(`Registered ${BOT_COMMANDS.length} commands`);
   } catch (e) { log.warn('Command registration failed:', e.message); }
 }
+async function handleTelegramCommands(state, api) {
+  if (!CONFIG.tgToken) return;
+  try {
+    const offset = state.lastTgUpdateId ? state.lastTgUpdateId + 1 : -1;
+    const res = await withTimeout(
+      fetch(`https://api.telegram.org/bot${CONFIG.tgToken}/getUpdates?offset=${offset}&timeout=0`),
+      CONFIG.netTimeoutMs, 'tg-poll');
+    const data = await res.json();
+    if (!data.ok || !Array.isArray(data.result)) return;
+    for (const upd of data.result) {
+      state.lastTgUpdateId = Math.max(state.lastTgUpdateId || 0, upd.update_id);
+      if (upd.callback_query) {
+        const cb = upd.callback_query;
+        if (String(cb.message?.chat?.id || cb.from?.id) !== CONFIG.tgChatId) continue;
+        await handleCallback(cb, state);
+        continue;
+      }
+      const msg = upd.message;
+      if (!msg?.text) continue;
+      if (String(msg.chat.id) !== CONFIG.tgChatId) continue;
+      const text = msg.text.trim();
+      let cmd, args;
+      if (BUTTON_MAP[text]) { cmd = BUTTON_MAP[text]; args = []; }
+      else { const p = text.split(/\s+/); cmd = p[0].toLowerCase().replace(/@\w+$/, ''); args = p.slice(1); }
+      await dispatchCommand(cmd, args, state, api);
+    }
+    saveState(state);
+  } catch {}
+}
+
+async function answerCallback(id, text = '') {
+  try {
+    await fetch(`https://api.telegram.org/bot${CONFIG.tgToken}/answerCallbackQuery`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: id, text }),
+    });
+  } catch {}
+}
+
+async function handleCallback(cb, state) {
+  const [action, ...rest] = (cb.data || '').split(':');
+  const target = rest.join(':').trim();
+  await answerCallback(cb.id);
+  if (!target) return;
+  if (action === 'watch') {
+    if (!state.watchedGroups.includes(target)) {
+      state.watchedGroups.push(target);
+      audit(state, 'watch_add', { group: target });
+      saveState(state);
+    }
+    await tgSend(`👁️ Added: <b>${escapeHtml(target)}</b>`);
+  } else if (action === 'unwatch') {
+    state.watchedGroups = state.watchedGroups.filter(g => g !== target);
+    audit(state, 'watch_remove', { group: target });
+    saveState(state);
+    await tgSend(`🚫 Removed: <b>${escapeHtml(target)}</b>`);
+  }
+}
+
+async function dispatchCommand(cmd, args, state, api) {
+  const uptimeMin = Math.floor((Date.now() - (state.startedAt || Date.now())) / 60_000);
+
+  switch (cmd) {
+    case '/start': {
+      await tgSend(`🎛️ <b>لوحة التحكم</b>`, { replyMarkup: MAIN_KEYBOARD });
+      await dispatchCommand('/status', [], state, api);
+      break;
+    }
+
+    case '/status': {
+      const regs = state.registeredCourses.length
+        ? state.registeredCourses.map(c => `• <code>${escapeHtml(c.code)}</code>`).join(' ')
+        : '—';
+      const target = state.targetCourseId ? `<code>${escapeHtml(state.targetCourseId)}</code>` : '⏳ waiting';
+      const ed = state.earlyDetection || {};
+      const openCount = Object.values(state.openGroupsState).filter(g => g.open).length;
+      await tgSend(
+        `🟢 <b>Watcher v10.0</b>\n` +
+        `⏱ <b>${uptimeMin} min</b> | 💾 <b>${rssMb()} MB</b> | ${state.paused ? '⏸ PAUSED' : '▶️ Running'}\n\n` +
+        `🎯 Target: <b>${escapeHtml(USER_CONFIG.targetCourse)}</b> (${target})\n` +
+        `📋 Status: ${state.targetCourseStatus != null ? statusLabel(state.targetCourseStatus) : '—'}\n` +
+        `🕐 Early: <b>${ed.enabled ? '🟢 ON (10s)' : '🔴 OFF'}</b> | checks: <b>${ed.checks || 0}</b> | hits: <b>${ed.hits || 0}</b>\n` +
+        `👁️ Watching: ${state.watchedGroups.length ? state.watchedGroups.map(escapeHtml).join(', ') : '<i>all</i>'}\n` +
+        `🔥 Open now: <b>${openCount}</b>\n\n` +
+        `🛡️ Baseline (${state.registeredCourses.length}): ${regs}\n\n` +
+        `📊 opens=<b>${state.counters.opens}</b> drops=<b>${state.counters.drops}</b> adds=<b>${state.counters.adds}</b> ` +
+        `relogins=<b>${state.counters.relogins}</b> errors=<b>${state.counters.errors}</b>`
+      );
+      break;
+    }
+
+    case '/early': {
+      const sub = (args[0] || '').toLowerCase();
+      const ed = state.earlyDetection = state.earlyDetection || {};
+      if (sub === 'on') {
+        ed.enabled = true;
+        saveState(state);
+        await tgSend(`🕐 <b>Early Detection: ON</b>\n\nChecking every <b>10 seconds</b>.`);
+      } else if (sub === 'off') {
+        ed.enabled = false;
+        saveState(state);
+        await tgSend(`🕐 <b>Early Detection: OFF</b>`);
+      } else if (sub === 'reset') {
+        ed.checks = ed.hits = 0;
+        ed.lastFound = ed.notifiedAt = 0;
+        saveState(state);
+        await tgSend(`🕐 Counters reset.`);
+      } else {
+        await tgSend(
+          `🕐 <b>Early Detection</b>\n\n` +
+          `Status: <b>${ed.enabled ? '🟢 ON' : '🔴 OFF'}</b>\n` +
+          `Interval: <b>10s</b>\n` +
+          `Checks: <b>${ed.checks || 0}</b>\n` +
+          `Hits: <b>${ed.hits || 0}</b>\n` +
+          `Target: <b>${escapeHtml(USER_CONFIG.targetCourse)}</b>\n` +
+          `Resolved: <b>${state.targetCourseId ? '✅' : '❌'}</b>\n` +
+          `Last check: ${timeSince(ed.lastCheck)}\n` +
+          (ed.lastFound ? `Last found: ${timeSince(ed.lastFound)}\n` : '') +
+          `\n<i>/early on | /early off | /early reset</i>`
+        );
+      }
+      break;
+    }
+
+    case '/baseline': {
+      const regs = state.registeredCourses.length
+        ? state.registeredCourses.map(c => `• <code>${escapeHtml(c.code)}</code> — ${escapeHtml(c.name)}`).join('\n')
+        : '—';
+      const missing = USER_CONFIG.expectedCourses.filter(exp =>
+        !state.registeredCourses.some(c => normalizeCode(c.code).includes(normalizeCode(exp))));
+      await tgSend(`🛡️ <b>Baseline</b>\n${regs}` +
+        (missing.length ? `\n\n⚠️ Missing: ${missing.map(escapeHtml).join(', ')}` : `\n\n✅ Complete`));
+      break;
+    }
+
+    case '/find': {
+      const q = args.join(' ').trim();
+      if (!q) { await tgSend(`Usage: /find &lt;code or name&gt;`); break; }
+      const r = await api.getCourses({ forceRefresh: true });
+      if (r.kind !== 'ok') { await tgSend(`❌ API: ${r.kind}`); break; }
+      const qUp = q.toUpperCase(), qNorm = qUp.replace(/\s+/g, '');
+      const matches = r.courses.filter(c =>
+        String(c.code).toUpperCase().includes(qUp) ||
+        String(c.name).toUpperCase().includes(qUp) ||
+        String(c.code).toUpperCase().replace(/\s+/g, '').includes(qNorm));
+      if (!matches.length) { await tgSend(`🔍 No matches. Total: ${r.courses.length}`); break; }
+      let msg = `🔍 <b>${matches.length} matches:</b>\n\n`;
+      matches.slice(0, 20).forEach((c, i) => {
+        msg += `${i+1}. <code>${escapeHtml(c.code)}</code> — ${escapeHtml(c.name)}\n   ${statusLabel(c.status)} | ID: <code>${escapeHtml(c.id)}</code>\n\n`;
+      });
+      await tgSend(msg);
+      break;
+    }
+
+    case '/diag': {
+      const r = await api.getCourses({ forceRefresh: true });
+      if (r.kind !== 'ok') { await tgSend(`❌ API: ${r.kind}`); break; }
+      const by = { 0:[], 1:[], 2:[], 3:[], 4:[], 5:[] };
+      for (const c of r.courses) { const s = Number(c.status); if (by[s]) by[s].push(c.code); }
+      let msg = `🩺 <b>Diagnostic</b>\n\n📊 Total: <b>${r.courses.length}</b>\n\n`;
+      for (const [s, codes] of Object.entries(by)) {
+        if (!codes.length) continue;
+        msg += `${statusLabel(Number(s))} (${codes.length}):\n<code>${codes.slice(0,15).map(escapeHtml).join(', ')}</code>\n\n`;
+      }
+      await tgSend(msg);
+      break;
+    }
+
+    case '/groups': {
+      if (!state.targetCourseId) {
+        await tgSend(`⏳ Target "<b>${escapeHtml(USER_CONFIG.targetCourse)}</b>" not available yet.\n\n🕐 Early Detection (10s) watching…`);
+        break;
+      }
+      const r = await api.getCourseSchedule(state.targetCourseId);
+      if (r.kind !== 'ok' || !r.groups?.length) { await tgSend(`❌ No groups yet.`); break; }
+      const sorted = [...r.groups].sort((a, b) => (a.available !== b.available) ? (a.available ? -1 : 1) : a.name.localeCompare(b.name));
+      let msg = `🎯 <b>${escapeHtml(USER_CONFIG.targetCourse)} — ${r.groups.length} groups</b>\n\n`;
+      sorted.slice(0, 20).forEach((g) => {
+        const w = state.watchedGroups.some(x => g.name.toUpperCase().includes(x.toUpperCase()));
+        msg += `${w ? '👁️ ' : ''}${g.available ? '🔥' : '❄️'} <b>${escapeHtml(g.name)}</b> — 💺 ${g.seats}/${g.total}\n`;
+        if (g.slots[0]) msg += `   📅 ${escapeHtml(g.slots[0].day)} | ⏰ ${escapeHtml(g.slots[0].time)}\n`;
+      });
+      const avail = sorted.filter(g => g.available).slice(0, 8);
+      const rows = avail.map(g => ([{ text: `👁️ Watch ${g.name} (${g.seats})`, callback_data: `watch:${g.name}`.slice(0, 64) }]));
+      await tgSend(msg, { replyMarkup: rows.length ? { inline_keyboard: rows } : undefined });
+      break;
+    }
+
+    case '/open': {
+      const openGroups = Object.entries(state.openGroupsState).filter(([_, v]) => v.open).map(([n, v]) => ({ name: n, ...v }));
+      if (!openGroups.length) { await tgSend(`❄️ No groups open.`); break; }
+      let msg = `🔥 <b>Open (${openGroups.length}):</b>\n\n`;
+      openGroups.forEach((g, i) => { msg += `${i+1}. <b>${escapeHtml(g.name)}</b> — 💺 ${g.seats}/${g.total}\n`; });
+      await tgSend(msg);
+      break;
+    }
+
+    case '/info': {
+      const r = await api.getRegInfo();
+      if (r.kind !== 'ok' || !r.data?.[0]) { await tgSend(`❌ API: ${r.kind}`); break; }
+      const info = r.data[0];
+      const status = info.RegAvailabilty === 1 ? '✅ OPEN' : (info.RegAvailabilty === -1 ? '⏳ NOT STARTED' : '🚫 BLOCKED');
+      await tgSend(
+        `ℹ️ <b>Registration</b>\n\nStatus: <b>${status}</b>\n` +
+        (info.RegAvailabiltyReason ? `<i>${escapeHtml(info.RegAvailabiltyReason)}</i>\n` : '') +
+        `\n📅 Ends: <b>${escapeHtml(String(info.RegEndDate || '—'))}</b>\n` +
+        `💰 Balance: <b>${escapeHtml(String(info.StudentCredit || '—'))} ${escapeHtml(String(info.Currency || ''))}</b>\n` +
+        `⏱ Permitted: <b>${escapeHtml(String(info.AcademicAllowedHours || '—'))}</b> hrs\n` +
+        `📚 Registered: <b>${escapeHtml(String(info.RegisteredHours || '—'))}</b> hrs`
+      );
+      break;
+    }
+
+    case '/target': {
+      const code = args.join(' ').trim();
+      if (!code) { await tgSend(`Usage: /target &lt;code&gt;`); break; }
+      const resolved = await api.resolveTargetId(code, { onlyRegisterable: true });
+      if (resolved) {
+        state.targetCourseId = resolved.id;
+        state.targetCourseCode = resolved.code;
+        state.targetCourseName = resolved.name;
+        state.targetCourseStatus = resolved.status;
+        state.watchedGroups = [];
+        state.openGroupsState = {};
+        audit(state, 'target_set_manual', { code, id: resolved.id });
+        saveState(state);
+        await tgSend(`🎯 <b>Target</b>\n\n<code>${escapeHtml(resolved.code)}</code> — ${escapeHtml(resolved.name)}\nID: <code>${escapeHtml(resolved.id)}</code>\n${statusLabel(resolved.status)}`);
+      } else {
+        await tgSend(`❌ Not found or not registerable.`);
+      }
+      break;
+    }
+
+    case '/watch': {
+      if (!args.length) {
+        await tgSend(state.watchedGroups.length
+          ? `👁️ Watching: ${state.watchedGroups.map(g => `<code>${escapeHtml(g)}</code>`).join(', ')}`
+          : `👁️ Empty — will alert on ANY group.`);
+        break;
+      }
+      const grp = args.join(' ').trim();
+      if (!state.watchedGroups.includes(grp)) {
+        state.watchedGroups.push(grp);
+        saveState(state);
+      }
+      await tgSend(`👁️ Watching: <b>${escapeHtml(grp)}</b>`);
+      break;
+    }
+
+    case '/unwatch': {
+      if (!args.length) { await tgSend(`Usage: /unwatch &lt;group&gt; | /unwatch all`); break; }
+      const t = args.join(' ').trim();
+      if (t.toLowerCase() === 'all') { state.watchedGroups = []; }
+      else { state.watchedGroups = state.watchedGroups.filter(g => g !== t); }
+      saveState(state);
+      await tgSend(`🚫 Cleared/removed.`);
+      break;
+    }
+
+    case '/reset': {
+      state.targetCourseId = state.targetCourseCode = state.targetCourseName = state.targetCourseStatus = null;
+      state.watchedGroups = [];
+      state.openGroupsState = {};
+      audit(state, 'reset');
+      saveState(state);
+      await tgSend(`🔄 Reset complete.`);
+      break;
+    }
+
+    case '/audit': {
+      const last = state.audit.slice(-10).map(e =>
+        `• <code>${new Date(e.t).toISOString().slice(11,19)}</code> ${escapeHtml(e.event)}`).join('\n');
+      await tgSend(`📜 <b>Last 10</b>\n${last || '—'}`);
+      break;
+    }
+
+    case '/pause': {
+      state.paused = true; saveState(state);
+      await tgSend('⏸️ Paused');
+      break;
+    }
+
+    case '/resume': {
+      state.paused = false; saveState(state);
+      await tgSend('▶️ Resumed');
+      break;
+    }
+
+    case '/help': {
+      await tgSend(`🤖 <b>Commands</b>\n\n` + BOT_COMMANDS.map(c => `/<b>${c.command}</b> — ${c.description}`).join('\n'), { replyMarkup: MAIN_KEYBOARD });
+      break;
+    }
+  }
+  saveState(state);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SESSION
+// ═══════════════════════════════════════════════════════════════════════════
+function sessionAgeMinutes() {
+  try {
+    if (fs.existsSync(CONFIG.sessionMetaFile)) {
+      const m = JSON.parse(fs.readFileSync(CONFIG.sessionMetaFile, 'utf8'));
+      return m.savedAt ? (Date.now() - m.savedAt) / 60000 : Infinity;
+    }
+  } catch {}
+  return Infinity;
+}
+function cleanupSession() { try { if (fs.existsSync(CONFIG.sessionFile)) fs.unlinkSync(CONFIG.sessionFile); } catch {} }
+async function saveSession(ctx) {
+  try {
+    await ctx.storageState({ path: CONFIG.sessionFile });
+    atomicWrite(CONFIG.sessionMetaFile, { savedAt: Date.now() });
+  } catch (e) { log.warn('Session save failed:', e.message); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  BROWSER
+// ═══════════════════════════════════════════════════════════════════════════
+async function createBrowser() {
+  return chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+      '--disable-gpu', '--disable-extensions', '--no-zygote',
+      '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
+      '--js-flags=--max-old-space-size=512',
+    ],
+  });
+}
+
+async function createAuthContext(browser, useCookies = true) {
+  const opts = {
+    baseURL: CONFIG.baseUrl, timezoneId: CONFIG.timezone,
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  };
+  if (useCookies && fs.existsSync(CONFIG.sessionFile)) opts.storageState = CONFIG.sessionFile;
+  return browser.newContext(opts);
+}
+
+async function loginAndCaptureCookies(browser) {
+  log.info('Logging in…');
+  const ctx = await browser.newContext({
+    viewport: { width: 1280, height: 720 },
+    timezoneId: CONFIG.timezone,
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  });
+  const page = await ctx.newPage();
+  await page.route('**/*', (r) => {
+    const t = r.request().resourceType();
+    if (t === 'image' || t === 'font' || t === 'media' || t === 'stylesheet') return r.abort();
+    return r.continue();
+  });
+  await page.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
+
+  await retry(async () => {
+    await page.goto(CONFIG.loginUrl, { waitUntil: 'domcontentloaded', timeout: CONFIG.pageTimeoutMs });
+    await page.fill('input[type="text"]', CONFIG.username);
+    await page.fill('input[type="password"]', CONFIG.password);
+    await Promise.all([
+      page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {}),
+      page.click('input[type="submit"], button[type="submit"]'),
+    ]);
+    if (page.url().includes('/Login.aspx')) throw new Error('Login failed');
+  }, { attempts: 3, baseMs: 1_500, label: 'login' });
+
+  await saveSession(ctx);
+  await ctx.close();
+  log.ok('Logged in');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  API CLIENT — fetch inside authenticated page
+// ═══════════════════════════════════════════════════════════════════════════
+function makeApi(ctx, pageRef) {
+  let courseCache = { ts: 0, data: null };
+  const CACHE_TTL = 8 * 1000;
+
+  async function fetchInPage(path, options = {}) {
+    const result = await pageRef.page.evaluate(async ({ path, options }) => {
+      try {
+        const res = await fetch(path, {
+          method: options.method || 'GET',
+          credentials: 'include',
+          headers: {
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/json, text/plain, */*',
+          },
+        });
+        if (!res.ok) return { ok: false, status: res.status, text: '' };
+        const text = await res.text();
+        return { ok: true, status: res.status, text };
+      } catch (e) {
+        return { ok: false, status: 0, text: '', error: e.message };
+      }
+    }, { path, options });
+
+    if (!result.ok) {
+      if (result.status === 302 || result.status === 401) return { kind: 'session_dead' };
+      if (result.status >= 500) return { kind: 'soft_server' };
+      return { kind: 'net', error: result.error };
+    }
+    const s = String(result.text || '').trim();
+    if (s === '' || s === 'null' || s === '-1') return { kind: 'session_dead' };
+    if (s[0] === '<') {
+      if (/login|signin|Login\.aspx/i.test(s)) return { kind: 'session_dead' };
+      return { kind: 'soft_server' };
+    }
+    let data;
+    try { data = JSON.parse(s); } catch { return { kind: 'structural' }; }
+    return { kind: 'ok', data };
+  }
+
+  async function call(method, url, params) {
+    const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+    return fetchInPage(url + qs, { method });
+  }
+
+  return {
+    async getCourseSchedule(courseId) {
+      const r = await retry(() => call('GET', CONFIG.API.courseSchedule, { CourseId: courseId }),
+        { label: 'getCourseSchedule', attempts: 2 });
+      if (r.kind !== 'ok') return r;
+      if (!Array.isArray(r.data)) return { kind: 'structural' };
+
+      const groups = {};
+      for (const item of r.data) {
+        if (!item || item.Type !== 'Group') continue;
+        const gid = item.GroupId;
+        if (gid == null) continue;
+        if (!groups[gid]) {
+          const rawName = String(item.GroupName || '').trim();
+          const shortName = String(item.ShortName || '').trim();
+          const isUni = !!item.IsUniversity;
+          let displayName;
+          if (isUni && shortName && rawName) displayName = `${shortName}-${rawName}`;
+          else if (rawName) displayName = rawName;
+          else if (shortName) displayName = `${shortName}-${gid}`;
+          else displayName = `Group-${gid}`;
+          groups[gid] = {
+            id: gid, name: displayName, rawName, shortName,
+            isUniversity: isUni, blocked: !!item.IsBlocked,
+            total: parseInt(item.StudentsCount) || 0,
+            registered: parseInt(item.RegisteredCount) || 0,
+            slots: [],
+          };
+        }
+        groups[gid].slots.push({ day: item.DayWeekName, time: item.Time, hall: item.ClassRoomName, staff: item.Staff });
+      }
+      const list = Object.values(groups).map(g => ({
+        ...g,
+        seats: g.total - g.registered,
+        available: !g.blocked && (g.total - g.registered) > 0,
+      }));
+      return { kind: 'ok', groups: list };
+    },
+
+    async getCourses({ forceRefresh = false } = {}) {
+      if (!forceRefresh && courseCache.data && Date.now() - courseCache.ts < CACHE_TTL) {
+        return { kind: 'ok', courses: courseCache.data };
+      }
+      const r = await fetchInPage(
+        CONFIG.API.coursesList +
+        '?GradeStatusIds=0,1,2,3,4,5&GroupsIds=-1&IsVirtualRegisteration=false'
+      );
+      if (r.kind !== 'ok') return r;
+
+      const data = Array.isArray(r.data) ? r.data : [];
+      const list = data.map(c => ({
+        id: String(c.CourseId),
+        code: c.Code || '',
+        name: c.Name || '',
+        status: c.GradeStatusId,
+        group: c.GrpName,
+      }));
+      courseCache = { ts: Date.now(), data: list };
+      return { kind: 'ok', courses: list };
+    },
+
+    async getRegInfo() {
+      return retry(() => call('POST', CONFIG.API.regInfo), { label: 'getRegInfo', attempts: 2 });
+    },
+
+    async resolveTargetId(query, { onlyRegisterable = true } = {}) {
+      const r = await this.getCourses({ forceRefresh: true });
+      if (r.kind !== 'ok') return null;
+      const pool = onlyRegisterable ? r.courses.filter(c => isRegisterable(c.status)) : r.courses;
+      const qNorm = normalizeCode(query);
+      const qRaw = String(query).toUpperCase().trim();
+      const qNoSp = qRaw.replace(/\s+/g, '');
+      let f = pool.find(c => normalizeCode(c.code) === qNorm);
+      if (f) return f;
+      f = pool.find(c => String(c.code).toUpperCase().trim() === qRaw);
+      if (f) return f;
+      f = pool.find(c => normalizeCode(c.code).includes(qNorm));
+      if (f) return f;
+      f = pool.find(c => String(c.name).toUpperCase().includes(qRaw));
+      if (f) return f;
+      f = pool.find(c => String(c.name).toUpperCase().replace(/\s+/g, '').includes(qNoSp));
+      if (f) return f;
+      return null;
+    },
+  };
+}
+// ═══════════════════════════════════════════════════════════════════════════
+//  EARLY DETECTION
+// ═══════════════════════════════════════════════════════════════════════════
+async function earlyDetectionCheck(api, state) {
+  if (!state.earlyDetection?.enabled) return { found: false };
+  if (state.targetCourseId) return { found: false, alreadyResolved: true };
+
+  state.earlyDetection.checks++;
+  state.earlyDetection.lastCheck = Date.now();
+
+  const r = await api.getCourses({ forceRefresh: true });
+  if (r.kind !== 'ok') {
+    log.warn(`Early detection: ${r.kind}`);
+    return { found: false, error: r.kind };
+  }
+
+  const qNorm = normalizeCode(USER_CONFIG.targetCourse);
+  const qRaw  = String(USER_CONFIG.targetCourse).toUpperCase().trim();
+  const qNoSp = qRaw.replace(/\s+/g, '');
+
+  const found = r.courses.find(c =>
+    normalizeCode(c.code) === qNorm ||
+    String(c.code).toUpperCase().trim() === qRaw ||
+    normalizeCode(c.code).includes(qNorm) ||
+    String(c.name).toUpperCase().includes(qRaw) ||
+    String(c.name).toUpperCase().replace(/\s+/g, '').includes(qNoSp)
+  );
+
+  if (!found) {
+    if (state.earlyDetection.checks % 6 === 0) {
+      log.info(`Early: not yet (checked ${r.courses.length} courses, #${state.earlyDetection.checks})`);
+    }
+    return { found: false, checked: r.courses.length };
+  }
+
+  state.earlyDetection.hits++;
+  state.earlyDetection.lastFound = Date.now();
+  state.earlyDetection.notifiedAt = Date.now();
+
+  state.targetCourseId = found.id;
+  state.targetCourseCode = found.code;
+  state.targetCourseName = found.name;
+  state.targetCourseStatus = found.status;
+  state.watchedGroups = [];
+  state.openGroupsState = {};
+
+  log.ok(`🎉🎉🎉 EARLY DETECTION: ${found.code} (${found.name}) id=${found.id}`);
+  audit(state, 'early_hit', { code: found.code, id: found.id });
+
+  const msg =
+    `🎉🎉 <b>${escapeHtml(USER_CONFIG.targetCourse)} ظهرت!</b> 🎉🎉\n\n` +
+    `📋 Code: <code>${escapeHtml(found.code)}</code>\n` +
+    `📚 Name: ${escapeHtml(found.name)}\n` +
+    `🆔 ID: <code>${escapeHtml(found.id)}</code>\n` +
+    `📊 Status: ${statusLabel(found.status)}\n\n` +
+    `⚡ Sniping started automatically!\n` +
+    `📋 Use /groups to see groups\n` +
+    `🔗 Open DULMS to register`;
+  await tgSend(msg, { silent: false });
+
+  return { found: true, course: found };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECURITY
+// ═══════════════════════════════════════════════════════════════════════════
+function sameCourse(a, b) {
+  if (a.id && b.id) return String(a.id) === String(b.id);
+  return a.code && b.code && normalizeCode(a.code) === normalizeCode(b.code);
+}
+
+async function verifyRegistrationStability(api, state) {
+  const r = await api.getCourses();
+  if (r.kind !== 'ok') return { kind: r.kind };
+
+  const currentReg = r.courses
+    .filter(c => Number(c.status) === 3 || Number(c.status) === 4)
+    .map(c => ({ id: c.id, code: c.code, name: c.name }));
+
+  if (!state.registeredCourses.length) {
+    state.registeredCourses = currentReg;
+    log.ok(`Baseline set: ${currentReg.length} courses → ${currentReg.map(c => c.code).join(', ')}`);
+    audit(state, 'baseline_set', { codes: currentReg.map(c => c.code) });
+    return { kind: 'ok' };
+  }
+
+  for (const saved of state.registeredCourses) {
+    if (!currentReg.some(c => sameCourse(c, saved))) {
+      state.counters.drops++;
+      audit(state, 'course_dropped', { code: saved.code });
+      await tgSend(`🚨 <b>Dropped!</b>\n❌ ${escapeHtml(saved.code)} — ${escapeHtml(saved.name)}`);
+    }
+  }
+  for (const curr of currentReg) {
+    if (!state.registeredCourses.some(s => sameCourse(s, curr))) {
+      state.counters.adds++;
+      audit(state, 'course_added', { code: curr.code });
+      await tgSend(`✅ <b>New course!</b>\n➕ ${escapeHtml(curr.code)}`);
+    }
+  }
+  state.registeredCourses = currentReg;
+  return { kind: 'ok' };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SNIPER
+// ═══════════════════════════════════════════════════════════════════════════
+function filterMatchingGroups(groups, watched) {
+  if (!Array.isArray(groups)) return [];
+  const avail = groups.filter(g => g?.available && typeof g.name === 'string' && g.name.length > 0);
+  if (!watched?.length) return avail;
+  const w = watched.filter(x => typeof x === 'string').map(x => x.toUpperCase());
+  if (!w.length) return avail;
+  return avail.filter(g => w.some(p => String(g.name || '').toUpperCase().includes(p)));
+}
+
+async function sniperCheck(api, state) {
+  if (!state.targetCourseId) return { kind: 'no_target' };
+  const r = await api.getCourseSchedule(state.targetCourseId);
+  if (r.kind !== 'ok') return r;
+
+  const openGroups = filterMatchingGroups(r.groups, state.watchedGroups);
+  const currentlyOpen = new Set(openGroups.map(g => g.name));
+  if (!state.openGroupsState) state.openGroupsState = {};
+
+  const newlyOpened = openGroups.filter(g => !state.openGroupsState[g.name]?.open);
+  const closed = Object.entries(state.openGroupsState)
+    .filter(([n, v]) => v.open && !currentlyOpen.has(n)).map(([n]) => n);
+
+  for (const g of openGroups) {
+    state.openGroupsState[g.name] = { open: true, lastSeen: Date.now(), seats: g.seats, total: g.total };
+  }
+  for (const name of closed) {
+    if (state.openGroupsState[name]) {
+      state.openGroupsState[name].open = false;
+      state.openGroupsState[name].seats = 0;
+    }
+  }
+
+  if (newlyOpened.length > 0) {
+    state.counters.opens += newlyOpened.length;
+    state.counters.alertsSent++;
+    audit(state, 'target_open', { groups: newlyOpened.map(g => g.name) });
+
+    let msg = `🎉 <b>${escapeHtml(USER_CONFIG.targetCourse)} — ${newlyOpened.length} opened!</b>\n\n`;
+    newlyOpened.slice(0, 8).forEach((g, i) => {
+      msg += `<b>${i+1}. ${escapeHtml(g.name)}</b> — 💺 ${g.seats}/${g.total}\n`;
+      if (g.slots[0]) {
+        msg += `   📅 ${escapeHtml(g.slots[0].day)} | ⏰ ${escapeHtml(g.slots[0].time)}\n`;
+        if (g.slots[0].hall) msg += `   🏛 ${escapeHtml(g.slots[0].hall)}\n`;
+      }
+      msg += `\n`;
+    });
+    msg += `🔗 <b>Open DULMS NOW!</b>`;
+    await tgSend(msg, { silent: !USER_CONFIG.notifyWithSound });
+    saveState(state);
+  }
+
+  if (closed.length > 0) {
+    state.counters.closes += closed.length;
+    audit(state, 'target_close', { groups: closed });
+    saveState(state);
+  }
+
+  return { kind: 'open', groups: openGroups };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  MAIN LOOP
+// ═══════════════════════════════════════════════════════════════════════════
+async function runScan(browser, deadline) {
+  if (!fs.existsSync(CONFIG.sessionFile) || sessionAgeMinutes() > CONFIG.cookieMaxAgeMin) {
+    cleanupSession();
+    await loginAndCaptureCookies(browser);
+  }
+
+  let ctx = await createAuthContext(browser, true);
+
+  // Persistent page — opened once
+  const pageRef = { page: null };
+  pageRef.page = await ctx.newPage();
+  await pageRef.page.goto(CONFIG.coursesPageUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+    .catch((e) => log.warn('Page nav failed:', e.message));
+
+  let api = makeApi(ctx, pageRef);
+
+  const state = loadState();
+  state.startedAt = Date.now();
+  if (!state.earlyDetection) state.earlyDetection = defaultState().earlyDetection;
+
+  if (!state.tgChatId) state.tgChatId = CONFIG.tgChatId;
+  else if (state.tgChatId !== CONFIG.tgChatId) {
+    state.tgChatId = CONFIG.tgChatId;
+    await tgSend(`🔄 <b>Chat migrated</b>`, { replyMarkup: MAIN_KEYBOARD });
+  }
+  saveState(state);
+
+  const startupGapMs = USER_CONFIG.startupBriefHours * 60 * 60_000;
+  if (Date.now() - state.startupBriefedAt > startupGapMs) {
+    state.startupBriefedAt = Date.now();
+    await tgSend(
+      `🚀 <b>Watcher v10.0</b>\n\n` +
+      `🎯 Sniping <b>${escapeHtml(USER_CONFIG.targetCourse)}</b>\n` +
+      `🕐 Early Detection: <b>ON — every 10s</b>\n` +
+      `🛡️ Guarding <b>${state.registeredCourses.length}</b> courses\n\n` +
+      `Send /help or use the buttons.`,
+      { replyMarkup: MAIN_KEYBOARD }
+    );
+    saveState(state);
+  }
+
+  log.step(`STARTED — Target: ${USER_CONFIG.targetCourse} | Early every 10s`);
+
+  const timers = {
+    sniper:         Date.now() + 500,
+    security:       Date.now() + 1_500,
+    earlyDetection: Date.now() + 3_000,
+    telegram:       Date.now() + 1_000,
+    memory:         Date.now() + 60_000,
+    pageHealth:     Date.now() + 30_000,
+  };
+
+  while (Date.now() < deadline) {
+    const now = Date.now();
+    if (state.paused) { await sleep(1000); continue; }
+
+    if (now >= timers.telegram) {
+      await handleTelegramCommands(state, api);
+      timers.telegram = Date.now() + USER_CONFIG.telegramPollMs;
+    }
+
+    if (now >= timers.memory) {
+      const mb = rssMb();
+      if (mb >= CONFIG.memRestartMb) {
+        log.err(`Memory critical (${mb} MB) — rebuild`);
+        saveState(state);
+        try { await ctx.close(); } catch {}
+        return RESULT.REBUILD;
+      }
+      timers.memory = Date.now() + 60_000;
+    }
+
+    if (now >= timers.pageHealth) {
+      try {
+        const isClosed = pageRef.page.isClosed();
+        if (isClosed) {
+          log.warn('Page closed — reopening…');
+          pageRef.page = await ctx.newPage();
+          await pageRef.page.goto(CONFIG.coursesPageUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+          api = makeApi(ctx, pageRef);
+        }
+      } catch (e) {
+        log.warn('Page health check failed:', e.message);
+      }
+      timers.pageHealth = Date.now() + 30_000;
+    }
+
+    // EARLY DETECTION every 10s
+    if (!state.targetCourseId && state.earlyDetection.enabled && now >= timers.earlyDetection) {
+      try {
+        const ed = await earlyDetectionCheck(api, state);
+        if (ed.found) log.ok('🎉 Early detection HIT!');
+      } catch (e) {
+        log.warn('Early detection error:', e.message);
+      }
+      timers.earlyDetection = Date.now() + USER_CONFIG.earlyDetectionIntervalMs;
+      saveState(state);
+    }
+
+    // Security every 10 min
+    if (now >= timers.security) {
+      try {
+        const sr = await verifyRegistrationStability(api, state);
+        if (sr.kind === 'session_dead') {
+          log.warn('Session dead — relogin');
+          state.counters.relogins++;
+          try { await ctx.close(); } catch {}
+          cleanupSession();
+          await loginAndCaptureCookies(browser);
+          ctx = await createAuthContext(browser, true);
+          pageRef.page = await ctx.newPage();
+          await pageRef.page.goto(CONFIG.coursesPageUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+          api = makeApi(ctx, pageRef);
+          timers.security = Date.now() + 5_000;
+        } else if (sr.kind === 'ok') {
+          timers.security = Date.now() + USER_CONFIG.securityIntervalMs;
+        } else {
+          state.counters.errors++;
+          timers.security = Date.now() + 60_000;
+        }
+        saveState(state);
+      } catch (e) {
+        log.warn('Security error:', e.message);
+        timers.security = Date.now() + 60_000;
+      }
+    }
+
+    // Sniper every 10s
+    if (state.targetCourseId && now >= timers.sniper) {
+      try {
+        const sr = await sniperCheck(api, state);
+        if (sr.kind === 'session_dead') {
+          log.warn('Sniper: session dead — relogin');
+          state.counters.relogins++;
+          try { await ctx.close(); } catch {}
+          cleanupSession();
+          await loginAndCaptureCookies(browser);
+          ctx = await createAuthContext(browser, true);
+          pageRef.page = await ctx.newPage();
+          await pageRef.page.goto(CONFIG.coursesPageUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+          api = makeApi(ctx, pageRef);
+          timers.sniper = Date.now() + 5_000;
+        } else if (sr.kind === 'soft_server' || sr.kind === 'http') {
+          state.counters.errors++;
+          timers.sniper = Date.now() + 30_000;
+        } else {
+          timers.sniper = Date.now() + USER_CONFIG.sniperIntervalMs;
+        }
+      } catch (e) {
+        log.warn('Sniper error:', e.message);
+        timers.sniper = Date.now() + USER_CONFIG.sniperIntervalMs;
+      }
+    }
+
+    await sleep(USER_CONFIG.heartbeatMs);
+  }
+
+  try { await ctx.close(); } catch {}
+  return RESULT.COMPLETED;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SHUTDOWN
+// ═══════════════════════════════════════════════════════════════════════════
+let shuttingDown = false;
+function setupShutdownHandlers() {
+  const h = (sig) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.warn(`${sig} — saving state`);
+    try { saveState(loadState()); } catch {}
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => h('SIGTERM'));
+  process.on('SIGINT',  () => h('SIGINT'));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ENTRYPOINT
+// ═══════════════════════════════════════════════════════════════════════════
+(async () => {
+  if (!CONFIG.username || !CONFIG.password) { log.err('Missing credentials'); process.exit(1); }
+  setupShutdownHandlers();
+
+  const startTs = Date.now();
+  const deadline = startTs + CONFIG.durationMin * 60_000;
+
+  log.info(`Watcher v10.0 — PID ${process.pid}, RSS ${rssMb()} MB, ${CONFIG.durationMin} min`);
+
+  await registerBotCommands();
+
+  let iter = 0;
+  while (Date.now() < deadline && iter < 10) {
+    iter++;
+    const browser = await createBrowser();
+    let result;
+    try { result = await runScan(browser, deadline); }
+    catch (e) { log.err('Fatal:', e.message); if (e.stack) console.error(e.stack); result = RESULT.FATAL; }
+    finally { try { await browser.close(); } catch {} }
+
+    if (result === RESULT.COMPLETED) { log.ok('Run completed'); break; }
+    if (result === RESULT.REBUILD) { log.info('Rebuilding…'); await sleep(2_000); continue; }
+    if (result === RESULT.FATAL) { log.err('Fatal — aborting'); break; }
+  }
+
+  try { saveState(loadState()); } catch {}
+  log.info(`Exiting — RSS ${rssMb()} MB`);
+})();
