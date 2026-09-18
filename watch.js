@@ -1,11 +1,13 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- *  DULMS Watcher v9.3 — Root Solution Edition
+ *  DULMS Watcher v9.4 — Authenticated Context Edition
  *  ---------------------------------------------------------------------------
- *  Key change:
- *   • AJAX interception via browser page to capture EXACT parameters
- *   • Uses the same params the DULMS page uses → returns ALL courses
- *   • Caches the course list for 5 minutes
- *   • Falls back to direct API if interception fails
+ *  Key fix over v9.3:
+ *   • Uses context.newPage() (not browser.newPage()) so cookies apply
+ *   • DOM scraping fallback (works like v7)
+ *   • Longer AJAX wait (20s)
+ *   • Detailed progress logs
+ *   • Registerable-only filter for /target
+ *   • Full diagnostic commands (/find, /diag, /probe)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 'use strict';
@@ -21,7 +23,9 @@ const USER_CONFIG = {
   targetCourse:         'GEN 101',
   targetCourseId:       null,
   targetIsLectureOnly:  true,
+
   expectedCourses:      ['MEC151', 'BAS111', 'CIV111', 'CIV121', 'CIV131'],
+
   preferredGroups:      [],
 
   sniperIntervalMs:     10 * 1000,
@@ -39,8 +43,8 @@ const USER_CONFIG = {
 //  RUNTIME CONFIG
 // ═══════════════════════════════════════════════════════════════════════════
 const CONFIG = {
-  baseUrl:      'https://dulms.deltauniv.edu.eg',
-  loginUrl:     'https://dulms.deltauniv.edu.eg/Login.aspx',
+  baseUrl:        'https://dulms.deltauniv.edu.eg',
+  loginUrl:       'https://dulms.deltauniv.edu.eg/Login.aspx',
   coursesPageUrl: 'https://dulms.deltauniv.edu.eg/Registered/CoursesRegisteration',
 
   API: {
@@ -69,7 +73,7 @@ const CONFIG = {
   auditMaxBytes:    1 * 1024 * 1024,
 
   timezone:         'Africa/Cairo',
-  stateVersion:     93,
+  stateVersion:     94,
 };
 
 const RESULT = Object.freeze({
@@ -117,6 +121,11 @@ function statusLabel(status) {
   };
   if (status == null) return '❓ Unknown';
   return map[Number(status)] || `❓ Unknown (${status})`;
+}
+
+function isRegisterable(status) {
+  const s = Number(status);
+  return s === 0 || s === 2 || s === 5;
 }
 
 async function withTimeout(promise, ms, label = 'op') {
@@ -180,6 +189,7 @@ function defaultState() {
     watchedGroups:        [...USER_CONFIG.preferredGroups],
     startupBriefedAt:     0,
     paused:               false,
+    targetResolveFailures: 0,
     audit:                [],
     counters: {
       opens: 0, closes: 0, drops: 0, adds: 0,
@@ -246,6 +256,7 @@ async function tgSend(html, { silent = false, replyMarkup = null } = {}) {
       while (tgTimestamps.length && now - tgTimestamps[0] > 60_000) tgTimestamps.shift();
       if (tgTimestamps.length >= USER_CONFIG.maxTelegramPerMin) {
         const wait = 60_000 - (now - tgTimestamps[0]) + 100;
+        log.warn(`TG rate limit — waiting ${wait}ms`);
         await sleep(wait);
       }
       tgTimestamps.push(Date.now());
@@ -272,6 +283,7 @@ async function tgSend(html, { silent = false, replyMarkup = null } = {}) {
         const body = await res.json().catch(() => ({}));
         if (!body.ok && body.error_code === 429) {
           const retry = (body.parameters && body.parameters.retry_after) || 5;
+          log.warn(`TG 429 — retry in ${retry}s`);
           tgQueue.unshift({ html: msg, silent: sil, replyMarkup: rm });
           await sleep(retry * 1000);
         }
@@ -291,16 +303,27 @@ const MAIN_KEYBOARD = {
   ],
   resize_keyboard: true,
   is_persistent: true,
+  input_field_placeholder: 'اختر أمرًا أو اكتب /help',
 };
 
 const BUTTON_MAP = {
-  '📊 Status': '/status', '🎯 Groups': '/groups', '🔥 Open': '/open',
-  '🔍 Find': '/find', '👁️ Watch': '/watch', '📋 Audit': '/audit',
-  '⏸️ Pause': '/pause', '▶️ Resume': '/resume', '🔄 Reset': '/reset', '❓ Help': '/help',
+  '📊 Status':   '/status',
+  '🎯 Groups':   '/groups',
+  '🔥 Open':     '/open',
+  '🔍 Find':     '/find',
+  '👁️ Watch':    '/watch',
+  '📋 Audit':    '/audit',
+  '⏸️ Pause':    '/pause',
+  '▶️ Resume':   '/resume',
+  '🔄 Reset':    '/reset',
+  '❓ Help':     '/help',
 };
 
 async function sendMainKeyboard() {
-  await tgSend(`🎛️ <b>لوحة التحكم</b>\nاستخدم الأزرار تحت أو اكتب /help`, { replyMarkup: MAIN_KEYBOARD });
+  await tgSend(
+    `🎛️ <b>لوحة التحكم</b>\nاستخدم الأزرار تحت أو اكتب /help`,
+    { replyMarkup: MAIN_KEYBOARD }
+  );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -331,7 +354,10 @@ async function registerBotCommands() {
     await fetch(`https://api.telegram.org/bot${CONFIG.tgToken}/setMyCommands`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ commands: BOT_COMMANDS, scope: { type: 'chat', chat_id: CONFIG.tgChatId } }),
+      body: JSON.stringify({
+        commands: BOT_COMMANDS,
+        scope: { type: 'chat', chat_id: CONFIG.tgChatId },
+      }),
     });
     log.ok(`Registered ${BOT_COMMANDS.length} bot commands`);
   } catch (e) { log.warn('Command registration failed:', e.message); }
@@ -350,6 +376,7 @@ async function handleTelegramCommands(state, api, timers) {
 
     for (const upd of data.result) {
       state.lastTgUpdateId = Math.max(state.lastTgUpdateId || 0, upd.update_id);
+
       if (upd.callback_query) {
         const cb = upd.callback_query;
         const chatId = String(cb.message?.chat?.id || cb.from?.id);
@@ -357,15 +384,28 @@ async function handleTelegramCommands(state, api, timers) {
         await handleCallback(cb, state, api);
         continue;
       }
+
       const msg = upd.message;
       if (!msg || !msg.text) continue;
+
       const chatId = String(msg.chat.id);
-      if (chatId !== CONFIG.tgChatId) { log.warn(`Unauthorized: ${chatId}`); continue; }
+      if (chatId !== CONFIG.tgChatId) {
+        log.warn(`Unauthorized chat: ${chatId}`);
+        audit(state, 'unauthorized', { chatId });
+        continue;
+      }
 
       const text = msg.text.trim();
       let cmd, args;
-      if (BUTTON_MAP[text]) { cmd = BUTTON_MAP[text]; args = []; }
-      else { const parts = text.split(/\s+/); cmd = parts[0].toLowerCase().replace(/@\w+$/, ''); args = parts.slice(1); }
+      if (BUTTON_MAP[text]) {
+        cmd = BUTTON_MAP[text];
+        args = [];
+      } else {
+        const parts = text.split(/\s+/);
+        cmd = parts[0].toLowerCase().replace(/@\w+$/, '');
+        args = parts.slice(1);
+      }
+
       await dispatchCommand(cmd, args, state, api, timers);
     }
     saveState(state);
@@ -422,12 +462,16 @@ async function dispatchCommand(cmd, args, state, api, timers) {
       const target = state.targetCourseId
         ? `<code>${escapeHtml(state.targetCourseId)}</code>`
         : '⏳ resolving';
-      const targetStatus = state.targetCourseStatus != null ? statusLabel(state.targetCourseStatus) : '—';
-      const watched = state.watchedGroups.length ? state.watchedGroups.map(escapeHtml).join(', ') : '<i>all</i>';
+      const targetStatus = state.targetCourseStatus != null
+        ? statusLabel(state.targetCourseStatus)
+        : '—';
+      const watched = state.watchedGroups.length
+        ? state.watchedGroups.map(escapeHtml).join(', ')
+        : '<i>all groups</i>';
       const openCount = Object.values(state.openGroupsState).filter(g => g.open).length;
 
       await tgSend(
-        `🟢 <b>Watcher v9.3</b>\n` +
+        `🟢 <b>Watcher v9.4</b>\n` +
         `⏱ Uptime: <b>${uptimeMin} min</b> | 💾 RSS: <b>${rssMb()} MB</b>\n` +
         `${state.paused ? '⏸ <b>PAUSED</b>' : '▶️ Running'}\n\n` +
         `🎯 Target: <b>${escapeHtml(USER_CONFIG.targetCourse)}</b> (${target})\n` +
@@ -437,9 +481,12 @@ async function dispatchCommand(cmd, args, state, api, timers) {
         `🔥 Open now: <b>${openCount}</b>\n\n` +
         `🛡️ Baseline (${state.registeredCourses.length}): ${regs}\n\n` +
         `📊 <b>Counters:</b>\n` +
-        `opens=<b>${state.counters.opens}</b> closes=<b>${state.counters.closes}</b> ` +
-        `drops=<b>${state.counters.drops}</b> adds=<b>${state.counters.adds}</b>\n` +
-        `relogins=<b>${state.counters.relogins}</b> errors=<b>${state.counters.errors}</b> ` +
+        `opens=<b>${state.counters.opens}</b> ` +
+        `closes=<b>${state.counters.closes}</b> ` +
+        `drops=<b>${state.counters.drops}</b> ` +
+        `adds=<b>${state.counters.adds}</b>\n` +
+        `relogins=<b>${state.counters.relogins}</b> ` +
+        `errors=<b>${state.counters.errors}</b> ` +
         `alerts=<b>${state.counters.alertsSent}</b>`
       );
       break;
@@ -461,9 +508,15 @@ async function dispatchCommand(cmd, args, state, api, timers) {
 
     case '/find': {
       const q = args.join(' ').trim();
-      if (!q) { await tgSend(`Usage: <code>/find &lt;code or name&gt;</code>`); break; }
-      const r = await api.getCourses({ statuses: '0,1,2,3,4,5', forceRefresh: true });
-      if (r.kind !== 'ok' || !r.courses) { await tgSend(`❌ API error: ${r.kind}`); break; }
+      if (!q) {
+        await tgSend(`🔍 Usage: <code>/find &lt;code or name&gt;</code>`);
+        break;
+      }
+      const r = await api.getCourses({ forceRefresh: true });
+      if (r.kind !== 'ok' || !r.courses) {
+        await tgSend(`❌ API error: ${r.kind}`);
+        break;
+      }
       const qUp = q.toUpperCase();
       const qNorm = qUp.replace(/\s+/g, '');
       const matches = r.courses.filter(c =>
@@ -472,12 +525,18 @@ async function dispatchCommand(cmd, args, state, api, timers) {
         String(c.code).toUpperCase().replace(/\s+/g, '').includes(qNorm)
       );
       if (matches.length === 0) {
-        await tgSend(`🔍 <b>No matches for "${escapeHtml(q)}"</b>\nTotal: ${r.courses.length}`);
+        await tgSend(
+          `🔍 <b>No matches for "${escapeHtml(q)}"</b>\n\n` +
+          `📊 Total from API: <b>${r.courses.length}</b>\n\n` +
+          `<i>Try /diag to see all.</i>`
+        );
         break;
       }
       let msg = `🔍 <b>${matches.length} match(es):</b>\n\n`;
       matches.slice(0, 20).forEach((c, i) => {
-        msg += `${i + 1}. <code>${escapeHtml(c.code)}</code>\n   ${escapeHtml(c.name)}\n   ${statusLabel(c.status)} | ID: <code>${escapeHtml(c.id)}</code>\n\n`;
+        msg += `${i + 1}. <code>${escapeHtml(c.code)}</code>\n`;
+        msg += `   ${escapeHtml(c.name)}\n`;
+        msg += `   ${statusLabel(c.status)} | ID: <code>${escapeHtml(c.id)}</code>\n\n`;
       });
       if (matches.length > 20) msg += `…+${matches.length - 20} more`;
       await tgSend(msg);
@@ -485,15 +544,23 @@ async function dispatchCommand(cmd, args, state, api, timers) {
     }
 
     case '/diag': {
-      const r = await api.getCourses({ statuses: '0,1,2,3,4,5', forceRefresh: true });
-      if (r.kind !== 'ok' || !r.courses) { await tgSend(`❌ API error: ${r.kind}`); break; }
+      const r = await api.getCourses({ forceRefresh: true });
+      if (r.kind !== 'ok' || !r.courses) {
+        await tgSend(`❌ API error: ${r.kind}`);
+        break;
+      }
       const byStatus = { 0: [], 1: [], 2: [], 3: [], 4: [], 5: [] };
-      for (const c of r.courses) { const s = Number(c.status); if (byStatus[s]) byStatus[s].push(c.code); }
-      let msg = `🩺 <b>Diagnostic Dump</b>\n\n📊 <b>Total: ${r.courses.length} courses</b>\n\n`;
+      for (const c of r.courses) {
+        const s = Number(c.status);
+        if (byStatus[s]) byStatus[s].push(c.code);
+      }
+      let msg = `🩺 <b>Diagnostic Dump</b>\n\n`;
+      msg += `📊 <b>Total: ${r.courses.length} courses</b>\n\n`;
       for (const [s, codes] of Object.entries(byStatus)) {
         if (codes.length === 0) continue;
-        msg += `${statusLabel(Number(s))} (${codes.length}):\n<code>${codes.slice(0, 15).map(escapeHtml).join(', ')}</code>\n`;
-        if (codes.length > 15) msg += `…+${codes.length - 15} more\n`;
+        msg += `${statusLabel(Number(s))} (${codes.length}):\n`;
+        msg += `<code>${codes.slice(0, 15).map(escapeHtml).join(', ')}</code>\n`;
+        if (codes.length > 15) msg += `<i>…+${codes.length - 15}</i>\n`;
         msg += `\n`;
       }
       await tgSend(msg);
@@ -501,7 +568,10 @@ async function dispatchCommand(cmd, args, state, api, timers) {
     }
 
     case '/groups': {
-      if (!state.targetCourseId) { await tgSend(`⚠️ Target not resolved. Try <code>/target GEN101</code>`); break; }
+      if (!state.targetCourseId) {
+        await tgSend(`⚠️ Target not resolved. Try <code>/target GEN101</code>`);
+        break;
+      }
       const r = await api.getCourseSchedule(state.targetCourseId);
       if (r.kind !== 'ok' || !r.groups || r.groups.length === 0) {
         await tgSend(`❌ No groups for <b>${escapeHtml(USER_CONFIG.targetCourse)}</b>.`);
@@ -511,44 +581,66 @@ async function dispatchCommand(cmd, args, state, api, timers) {
         if (a.available !== b.available) return a.available ? -1 : 1;
         return a.name.localeCompare(b.name);
       });
-      let msg = `🎯 <b>${escapeHtml(USER_CONFIG.targetCourse)} — ${r.groups.length} groups</b>\n<i>🔥=open · ❄️=full · 👁️=watched</i>\n\n`;
+      let msg = `🎯 <b>${escapeHtml(USER_CONFIG.targetCourse)} — ${r.groups.length} groups</b>\n`;
+      msg += `<i>🔥=open · ❄️=full · 👁️=watched</i>\n\n`;
       sorted.slice(0, 20).forEach((g) => {
-        const watched = state.watchedGroups.some(w => g.name.toUpperCase().includes(w.toUpperCase()));
+        const watched = state.watchedGroups.some(w =>
+          g.name.toUpperCase().includes(w.toUpperCase())
+        );
         const mark = watched ? '👁️ ' : '';
         const icon = g.available ? '🔥' : '❄️';
         const blocked = g.blocked ? ' 🚫' : '';
         msg += `${mark}${icon} <b>${escapeHtml(g.name)}</b>${blocked} — 💺 ${g.seats}/${g.total}\n`;
-        if (g.slots[0]) msg += `   📅 ${escapeHtml(g.slots[0].day)} | ⏰ ${escapeHtml(g.slots[0].time)}\n`;
+        if (g.slots[0]) {
+          msg += `   📅 ${escapeHtml(g.slots[0].day)} | ⏰ ${escapeHtml(g.slots[0].time)}\n`;
+          if (g.slots[0].hall) msg += `   🏛 ${escapeHtml(g.slots[0].hall)}\n`;
+        }
       });
-      if (sorted.length > 20) msg += `\n…+${sorted.length - 20} more`;
+      if (sorted.length > 20) msg += `\n<i>…+${sorted.length - 20} more</i>`;
       const availableGroups = sorted.filter(g => g.available).slice(0, 8);
-      const inlineRows = availableGroups.map(g => ([{ text: `👁️ Watch ${g.name} (${g.seats})`, callback_data: `watch:${g.name}`.slice(0, 64) }]));
+      const inlineRows = availableGroups.map(g => ([{
+        text: `👁️ Watch ${g.name} (${g.seats})`,
+        callback_data: `watch:${g.name}`.slice(0, 64),
+      }]));
       await tgSend(msg, { replyMarkup: inlineRows.length ? { inline_keyboard: inlineRows } : undefined });
       break;
     }
 
     case '/open': {
-      const openGroups = Object.entries(state.openGroupsState).filter(([_, v]) => v.open).map(([name, v]) => ({ name, ...v }));
-      if (openGroups.length === 0) { await tgSend(`❄️ <b>No groups open</b>`); break; }
-      let msg = `🔥 <b>Open (${openGroups.length}):</b>\n\n`;
-      openGroups.forEach((g, i) => { msg += `<b>${i + 1}. ${escapeHtml(g.name)}</b> — 💺 ${g.seats}/${g.total}\n`; });
+      const openGroups = Object.entries(state.openGroupsState)
+        .filter(([_, v]) => v.open)
+        .map(([name, v]) => ({ name, ...v }));
+      if (openGroups.length === 0) {
+        await tgSend(`❄️ <b>No groups currently open</b>`);
+        break;
+      }
+      let msg = `🔥 <b>Currently open (${openGroups.length}):</b>\n\n`;
+      openGroups.forEach((g, i) => {
+        msg += `<b>${i + 1}. ${escapeHtml(g.name)}</b> — 💺 ${g.seats}/${g.total}\n`;
+      });
       await tgSend(msg);
       break;
     }
 
     case '/info': {
       const r = await api.getRegInfo();
-      if (r.kind !== 'ok' || !Array.isArray(r.data) || r.data.length === 0) { await tgSend(`❌ API error: ${r.kind}`); break; }
+      if (r.kind !== 'ok' || !Array.isArray(r.data) || r.data.length === 0) {
+        await tgSend(`❌ API error: ${r.kind}`);
+        break;
+      }
       const info = r.data[0];
       const avail = info.RegAvailabilty;
       const statusTxt = avail === 1 ? '✅ OPEN' : (avail === -1 ? '⏳ NOT STARTED' : '🚫 BLOCKED');
       await tgSend(
-        `ℹ️ <b>Registration Info</b>\n\nStatus: <b>${statusTxt}</b>\n` +
+        `ℹ️ <b>Registration Info</b>\n\n` +
+        `Status: <b>${statusTxt}</b>\n` +
         (info.RegAvailabiltyReason ? `<i>${escapeHtml(info.RegAvailabiltyReason)}</i>\n` : '') +
         `\n📅 Reg ends: <b>${escapeHtml(String(info.RegEndDate || '—'))}</b>\n` +
+        `📅 Edit ends: <b>${escapeHtml(String(info.RegEditEndDate || '—'))}</b>\n\n` +
         `💰 Balance: <b>${escapeHtml(String(info.StudentCredit || '—'))} ${escapeHtml(String(info.Currency || ''))}</b>\n` +
         `⏱ Permitted: <b>${escapeHtml(String(info.AcademicAllowedHours || '—'))}</b> hrs\n` +
-        `📚 Registered: <b>${escapeHtml(String(info.RegisteredHours || '—'))}</b> hrs`
+        `📚 Registered: <b>${escapeHtml(String(info.RegisteredHours || '—'))}</b> hrs\n` +
+        `✅ Confirmed: <b>${escapeHtml(String(info.ConfirmedHours || '—'))}</b> hrs`
       );
       break;
     }
@@ -559,7 +651,8 @@ async function dispatchCommand(cmd, args, state, api, timers) {
         await tgSend(
           `🎯 <b>Set Target</b>\n\nUsage: <code>/target &lt;course_code&gt;</code>\n\n` +
           `Current: <b>${escapeHtml(USER_CONFIG.targetCourse)}</b> ` +
-          `(id: ${state.targetCourseId ? `<code>${escapeHtml(state.targetCourseId)}</code>` : 'not resolved'})`
+          `(id: ${state.targetCourseId ? `<code>${escapeHtml(state.targetCourseId)}</code>` : 'not resolved'})\n\n` +
+          `<i>⚠️ Only registerable courses (failed/withdrawn/never).</i>`
         );
         break;
       }
@@ -572,25 +665,32 @@ async function dispatchCommand(cmd, args, state, api, timers) {
         state.targetCourseStatus = resolved.status;
         state.watchedGroups = [];
         state.openGroupsState = {};
+        state.targetResolveFailures = 0;
         audit(state, 'target_set_manual', { code, id: resolved.id });
         saveState(state);
         await tgSend(
-          `🎯 <b>Target updated</b>\n\nCode: <code>${escapeHtml(resolved.code)}</code>\n` +
-          `Name: ${escapeHtml(resolved.name)}\nID: <code>${escapeHtml(resolved.id)}</code>\n` +
-          `Status: ${statusLabel(resolved.status)}\n\n<i>Watch list reset.</i>`
+          `🎯 <b>Target updated</b>\n\n` +
+          `Code: <code>${escapeHtml(resolved.code)}</code>\n` +
+          `Name: ${escapeHtml(resolved.name)}\n` +
+          `ID: <code>${escapeHtml(resolved.id)}</code>\n` +
+          `Status: ${statusLabel(resolved.status)}\n\n` +
+          `<i>Watch list reset. Use /groups.</i>`
+        );
+        break;
+      }
+      const all = await api.resolveTargetId(code, { onlyRegisterable: false });
+      if (all) {
+        await tgSend(
+          `⚠️ <b>"${escapeHtml(code)}" cannot be sniped</b>\n\n` +
+          `Code: <code>${escapeHtml(all.code)}</code>\n` +
+          `Status: <b>${statusLabel(all.status)}</b>\n\n` +
+          `<i>Only registerable courses accepted.</i>`
         );
       } else {
-        const all = await api.resolveTargetId(code, { onlyRegisterable: false });
-        if (all) {
-          await tgSend(
-            `⚠️ <b>"${escapeHtml(code)}" cannot be sniped</b>\n\nCode: <code>${escapeHtml(all.code)}</code>\n` +
-            `Status: <b>${statusLabel(all.status)}</b>\n\n<i>Only registerable courses accepted.</i>`
-          );
-        } else {
-          await tgSend(
-            `❌ <b>Could not find "${escapeHtml(code)}"</b>\n\nTry <code>/find ${escapeHtml(code.split(/\s+/)[0])}</code>`
-          );
-        }
+        await tgSend(
+          `❌ <b>Could not find "${escapeHtml(code)}"</b>\n\n` +
+          `Try <code>/find ${escapeHtml(code.split(/\s+/)[0])}</code> to search.`
+        );
       }
       break;
     }
@@ -598,9 +698,16 @@ async function dispatchCommand(cmd, args, state, api, timers) {
     case '/watch': {
       if (args.length === 0) {
         if (state.watchedGroups.length === 0) {
-          await tgSend(`👁️ <b>Watch list: empty</b>\nYou'll receive alerts for <b>ANY group</b>.\n\nUse <code>/groups</code> to see groups.`);
+          await tgSend(
+            `👁️ <b>Watch list: empty</b>\n\n` +
+            `You'll receive alerts for <b>ANY group</b>.\n\n` +
+            `Use <code>/groups</code> to see groups.`
+          );
         } else {
-          const rows = state.watchedGroups.map(g => ([{ text: `🚫 Unwatch ${g}`, callback_data: `unwatch:${g}`.slice(0, 64) }]));
+          const rows = state.watchedGroups.map(g => ([{
+            text: `🚫 Unwatch ${g}`,
+            callback_data: `unwatch:${g}`.slice(0, 64),
+          }]));
           let msg = `👁️ <b>Watch list (${state.watchedGroups.length}):</b>\n\n`;
           state.watchedGroups.forEach((g, i) => { msg += `${i + 1}. <code>${escapeHtml(g)}</code>\n`; });
           await tgSend(msg, { replyMarkup: { inline_keyboard: rows } });
@@ -618,14 +725,17 @@ async function dispatchCommand(cmd, args, state, api, timers) {
     }
 
     case '/unwatch': {
-      if (args.length === 0) { await tgSend(`Usage: <code>/unwatch &lt;group&gt;</code> or <code>/unwatch all</code>`); break; }
+      if (args.length === 0) {
+        await tgSend(`Usage: <code>/unwatch &lt;group&gt;</code> or <code>/unwatch all</code>`);
+        break;
+      }
       const target = args.join(' ').trim();
       if (target.toLowerCase() === 'all') {
         const count = state.watchedGroups.length;
         state.watchedGroups = [];
         audit(state, 'watch_clear');
         saveState(state);
-        await tgSend(`🚫 Cleared (was ${count}).`);
+        await tgSend(`🚫 Cleared watch list (was ${count}).`);
         break;
       }
       state.watchedGroups = state.watchedGroups.filter(g => g !== target);
@@ -642,9 +752,15 @@ async function dispatchCommand(cmd, args, state, api, timers) {
       state.targetCourseStatus = null;
       state.watchedGroups = [];
       state.openGroupsState = {};
+      state.targetResolveFailures = 0;
       audit(state, 'reset');
       saveState(state);
-      await tgSend(`🔄 <b>Reset complete</b>`);
+      await tgSend(
+        `🔄 <b>Reset complete</b>\n\n` +
+        `🎯 Target cleared\n` +
+        `👁️ Watch list cleared\n` +
+        `🔥 Open state cleared`
+      );
       break;
     }
 
@@ -652,24 +768,33 @@ async function dispatchCommand(cmd, args, state, api, timers) {
       const last = state.audit.slice(-10).map(e =>
         `• <code>${new Date(e.t).toISOString().slice(11,19)}</code> ${escapeHtml(e.event)}`
       ).join('\n');
-      await tgSend(`📜 <b>Last 10 events</b>\n${last || '—'}`);
+      await tgSend(`📜 <b>Last 10 events</b>\n${last || '— empty —'}`);
       break;
     }
 
     case '/pause': {
-      state.paused = true; audit(state, 'paused'); saveState(state);
-      await tgSend('⏸️ <b>Paused</b>');
+      state.paused = true;
+      audit(state, 'paused');
+      saveState(state);
+      await tgSend('⏸️ <b>Paused</b>\nSend /resume to continue.');
       break;
     }
 
     case '/resume': {
-      state.paused = false; audit(state, 'resumed'); saveState(state);
+      state.paused = false;
+      audit(state, 'resumed');
+      saveState(state);
       await tgSend('▶️ <b>Resumed</b>');
       break;
     }
 
     case '/help': {
-      await tgSend(`🤖 <b>Commands</b>\n\n` + BOT_COMMANDS.map(c => `/<b>${c.command}</b> — ${c.description}`).join('\n'), { replyMarkup: MAIN_KEYBOARD });
+      await tgSend(
+        `🤖 <b>الأوامر المتاحة</b>\n\n` +
+        BOT_COMMANDS.map(c => `/<b>${c.command}</b> — ${c.description}`).join('\n') +
+        `\n\n<i>💡 استخدم الأزرار تحت الشات</i>`,
+        { replyMarkup: MAIN_KEYBOARD }
+      );
       break;
     }
   }
@@ -707,9 +832,11 @@ async function createBrowser() {
   return chromium.launch({
     headless: true,
     args: [
-      '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-      '--disable-gpu', '--disable-extensions', '--no-zygote',
-      '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage', '--disable-gpu',
+      '--disable-extensions', '--no-zygote',
+      '--disable-background-timer-throttling',
+      '--disable-renderer-backgrounding',
       '--js-flags=--max-old-space-size=512',
     ],
   });
@@ -719,10 +846,16 @@ async function createRequestContext(browser, useCookies = true) {
   const opts = {
     baseURL: CONFIG.baseUrl,
     timezoneId: CONFIG.timezone,
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    extraHTTPHeaders: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json, text/plain, */*' },
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+               '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    extraHTTPHeaders: {
+      'X-Requested-With': 'XMLHttpRequest',
+      'Accept': 'application/json, text/plain, */*',
+    },
   };
-  if (useCookies && fs.existsSync(CONFIG.sessionFile)) opts.storageState = CONFIG.sessionFile;
+  if (useCookies && fs.existsSync(CONFIG.sessionFile)) {
+    opts.storageState = CONFIG.sessionFile;
+  }
   return browser.newContext(opts);
 }
 
@@ -731,15 +864,19 @@ async function loginAndCaptureCookies(browser) {
   const context = await browser.newContext({
     viewport: { width: 1280, height: 720 },
     timezoneId: CONFIG.timezone,
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+               '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
   });
   const page = await context.newPage();
+
   await page.route('**/*', (r) => {
     const t = r.request().resourceType();
     if (t === 'image' || t === 'font' || t === 'media' || t === 'stylesheet') return r.abort();
     return r.continue();
   });
-  await page.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
 
   await retry(async () => {
     await page.goto(CONFIG.loginUrl, { waitUntil: 'domcontentloaded', timeout: CONFIG.pageTimeoutMs });
@@ -749,7 +886,7 @@ async function loginAndCaptureCookies(browser) {
       page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {}),
       page.click('input[type="submit"], button[type="submit"]'),
     ]);
-    if (page.url().includes('/Login.aspx')) throw new Error('Login failed');
+    if (page.url().includes('/Login.aspx')) throw new Error('Login failed — still on Login.aspx');
   }, { attempts: 3, baseMs: 1_500, label: 'login' });
 
   await saveSession(context);
@@ -758,13 +895,14 @@ async function loginAndCaptureCookies(browser) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  API CLIENT — with AJAX interception
+//  API CLIENT — with authenticated AJAX interception
 // ═══════════════════════════════════════════════════════════════════════════
 function classifyApiResponse(res, body) {
   if (!res) return { kind: 'net' };
   if (res.status === 302 || res.status === 401) return { kind: 'session_dead' };
   if (res.status >= 500) return { kind: 'soft_server' };
   if (!res.ok) return { kind: 'http', status: res.status };
+
   const s = String(body || '').trim();
   if (s === '' || s === 'null' || s === '-1') return { kind: 'session_dead' };
   if (s[0] === '<') {
@@ -772,25 +910,35 @@ function classifyApiResponse(res, body) {
     return { kind: 'soft_server' };
   }
   let data;
-  try { data = JSON.parse(s); } catch { return { kind: 'structural' }; }
+  try { data = JSON.parse(s); }
+  catch { return { kind: 'structural' }; }
   return { kind: 'ok', data };
 }
 
-function makeApi(request, browser) {
+function makeApi(context) {
   let courseCache = { ts: 0, data: null };
 
+  // ⭐ Use context.request — inherits cookies
   async function call(method, url, { params, data } = {}) {
-    const fullUrl = params ? `${url}?${new URLSearchParams(params).toString()}` : url;
+    const fullUrl = params
+      ? `${url}?${new URLSearchParams(params).toString()}`
+      : url;
     const opts = { method, timeout: CONFIG.netTimeoutMs };
-    if (data) { opts.data = data; opts.headers = { 'Content-Type': 'application/json; charset=utf-8' }; }
-    const res = await request.fetch(fullUrl, opts);
+    if (data) {
+      opts.data = data;
+      opts.headers = { 'Content-Type': 'application/json; charset=utf-8' };
+    }
+    const res = await context.request.fetch(fullUrl, opts);
     const body = await res.text().catch(() => '');
     return classifyApiResponse(res, body);
   }
 
   return {
     async getCourseSchedule(courseId) {
-      const r = await retry(() => call('GET', CONFIG.API.courseSchedule, { params: { CourseId: courseId } }), { label: 'getCourseSchedule' });
+      const r = await retry(
+        () => call('GET', CONFIG.API.courseSchedule, { params: { CourseId: courseId } }),
+        { label: 'getCourseSchedule' }
+      );
       if (r.kind !== 'ok') return r;
       if (!Array.isArray(r.data)) return { kind: 'structural' };
 
@@ -802,35 +950,53 @@ function makeApi(request, browser) {
         if (item.Type !== 'Group') continue;
         const gid = item.GroupId;
         if (gid == null) continue;
+
         if (!groups[gid]) {
-          const rawName = String(item.GroupName || '').trim();
+          const rawName   = String(item.GroupName || '').trim();
           const shortName = String(item.ShortName || '').trim();
-          const isUni = !!item.IsUniversity;
+          const isUni     = !!item.IsUniversity;
           let displayName;
           if (isUni && shortName && rawName) displayName = `${shortName}-${rawName}`;
-          else if (rawName) displayName = rawName;
-          else if (shortName) displayName = `${shortName}-${gid}`;
-          else displayName = `Group-${gid}`;
-          groups[gid] = { id: gid, name: displayName, rawName, shortName, isUniversity: isUni, blocked: !!item.IsBlocked, selected: !!item.IsSelected, total: parseInt(item.StudentsCount) || 0, registered: parseInt(item.RegisteredCount) || 0, slots: [] };
+          else if (rawName)                  displayName = rawName;
+          else if (shortName)                displayName = `${shortName}-${gid}`;
+          else                               displayName = `Group-${gid}`;
+
+          groups[gid] = {
+            id: gid, name: displayName, rawName, shortName,
+            isUniversity: isUni, blocked: !!item.IsBlocked,
+            selected: !!item.IsSelected,
+            total: parseInt(item.StudentsCount) || 0,
+            registered: parseInt(item.RegisteredCount) || 0,
+            slots: [],
+          };
         }
-        groups[gid].slots.push({ day: item.DayWeekName, time: item.Time, hall: item.ClassRoomName, staff: item.Staff });
+        groups[gid].slots.push({
+          day: item.DayWeekName, time: item.Time,
+          hall: item.ClassRoomName, staff: item.Staff,
+        });
       }
-      const list = Object.values(groups).map(g => ({ ...g, seats: g.total - g.registered, available: !g.blocked && (g.total - g.registered) > 0 }));
+      const list = Object.values(groups).map(g => ({
+        ...g,
+        seats: g.total - g.registered,
+        available: !g.blocked && (g.total - g.registered) > 0,
+      }));
       return { kind: 'ok', groups: list, hasSubgroups };
     },
 
-    // ⭐⭐⭐ KEY FIX: Intercept AJAX from the real browser page
-    async getCourses({ statuses = '3,4', groups = '-1', virtual = false, forceRefresh = false } = {}) {
-      if (!forceRefresh && courseCache.data && Date.now() - courseCache.ts < USER_CONFIG.courseCacheTtlMs) {
+    // ⭐⭐⭐ KEY: Open page in SAME authenticated context
+    async getCourses({ forceRefresh = false } = {}) {
+      if (!forceRefresh && courseCache.data &&
+          Date.now() - courseCache.ts < USER_CONFIG.courseCacheTtlMs) {
         return { kind: 'ok', courses: courseCache.data };
       }
 
-      log.info('getCourses: opening CoursesRegisteration page to intercept AJAX…');
-      const page = await browser.newPage();
+      log.info('getCourses: opening CoursesRegisteration page (authenticated context)…');
+      // ⭐ context.newPage() — inherits cookies from storageState
+      const page = await context.newPage();
       let interceptedData = null;
 
       try {
-        // Set up response listener BEFORE navigation
+        // Listener BEFORE navigation
         page.on('response', async (response) => {
           const url = response.url();
           if (url.includes('/Registered/GetStudentResiterationCourses')) {
@@ -840,22 +1006,62 @@ function makeApi(request, browser) {
                 interceptedData = json;
                 log.ok(`Intercepted AJAX: ${json.length} courses`);
               }
-            } catch (e) { /* not JSON */ }
+            } catch (e) { /* not JSON, ignore */ }
           }
         });
 
-        await page.goto(CONFIG.coursesPageUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+        await page.goto(CONFIG.coursesPageUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: 30_000,
+        });
 
-        // Wait for the AJAX to fire (up to 15 seconds)
-        for (let i = 0; i < 30 && !interceptedData; i++) {
+        // Wait for the AJAX to fire (up to 20s)
+        for (let i = 0; i < 40 && !interceptedData; i++) {
           await sleep(500);
+          if (i > 0 && i % 6 === 0) {
+            log.info(`  waiting for AJAX… ${i * 0.5}s`);
+          }
         }
 
+        // ⭐ Fallback 1: DOM scraping (works like v7)
         if (!interceptedData) {
-          log.warn('Interception failed — falling back to direct API call');
-          const params = { GradeStatusIds: statuses, IsVirtualRegisteration: virtual };
-          if (groups !== '' && groups != null) params.GroupsIds = groups;
-          const r = await call('GET', CONFIG.API.coursesList, { params });
+          log.warn('AJAX interception failed — trying DOM scrape…');
+          try {
+            const domCourses = await page.evaluate(() => {
+              const items = document.querySelectorAll('article.course-item[id]');
+              return Array.from(items).map(el => {
+                const id = el.id;
+                const nameEl = el.querySelector('.course-name');
+                const nameText = nameEl ? nameEl.innerText.trim() : '';
+                const parts = nameText.split(' - ');
+                const code = parts[0] ? parts[0].trim() : '';
+                const name = parts.slice(1).join(' - ').trim();
+                let status = 5;
+                if (el.classList.contains('passed')) status = 1;
+                else if (el.classList.contains('failed')) status = 0;
+                else if (el.classList.contains('withdarw')) status = 2;
+                else if (el.classList.contains('registered')) status = 3;
+                return { id, code, name, status };
+              }).filter(x => x.code);
+            });
+            if (domCourses.length > 0) {
+              log.ok(`DOM scrape: ${domCourses.length} courses`);
+              interceptedData = domCourses.map(c => ({
+                CourseId: c.id, Code: c.code,
+                Name: c.name, GradeStatusId: c.status,
+              }));
+            }
+          } catch (e) {
+            log.warn('DOM scrape failed:', e.message);
+          }
+        }
+
+        // ⭐ Fallback 2: direct API with default params
+        if (!interceptedData) {
+          log.warn('All methods failed — direct API call');
+          const r = await call('GET', CONFIG.API.coursesList, {
+            params: { GradeStatusIds: '0,1,2,3,4,5', GroupsIds: '-1', IsVirtualRegisteration: false },
+          });
           if (r.kind !== 'ok') return r;
           interceptedData = r.data;
         }
@@ -881,36 +1087,50 @@ function makeApi(request, browser) {
       return retry(() => call('POST', CONFIG.API.regInfo), { label: 'getRegInfo' });
     },
 
+    // ⭐ Robust target resolution
     async resolveTargetId(query, { onlyRegisterable = true } = {}) {
       log.info(`resolveTargetId: query="${query}" onlyRegisterable=${onlyRegisterable}`);
-      const r = await this.getCourses({ statuses: '0,1,2,3,4,5', forceRefresh: true });
+
+      const r = await this.getCourses({ forceRefresh: true });
       if (r.kind !== 'ok' || !r.courses) return null;
 
-      const targetNorm = normalizeCode(query);
-      const targetRaw = String(query).toUpperCase().trim();
+      const pool = onlyRegisterable
+        ? r.courses.filter(c => isRegisterable(c.status))
+        : r.courses;
 
-      let found = r.courses.find(c => normalizeCode(c.code) === targetNorm);
-      if (found) { log.ok(`L1: ${found.code}`); return found; }
-      found = r.courses.find(c => String(c.code).toUpperCase().trim() === targetRaw);
-      if (found) { log.ok(`L2: ${found.code}`); return found; }
-      found = r.courses.find(c => normalizeCode(c.code).includes(targetNorm));
-      if (found) { log.ok(`L3: ${found.code}`); return found; }
-      found = r.courses.find(c => String(c.name).toUpperCase().includes(targetRaw));
-      if (found) { log.ok(`L4: ${found.code}`); return found; }
-      const qNoSp = targetRaw.replace(/\s+/g, '');
-      found = r.courses.find(c => String(c.name).toUpperCase().replace(/\s+/g, '').includes(qNoSp));
-      if (found) { log.ok(`L5: ${found.code}`); return found; }
+      log.info(`  searching in ${pool.length} courses (registerable=${onlyRegisterable})`);
+
+      const targetNorm = normalizeCode(query);
+      const targetRaw  = String(query).toUpperCase().trim();
+      const targetNoSp = targetRaw.replace(/\s+/g, '');
+
+      let found = pool.find(c => normalizeCode(c.code) === targetNorm);
+      if (found) { log.ok(`L1: ${found.code} (${found.status})`); return found; }
+
+      found = pool.find(c => String(c.code).toUpperCase().trim() === targetRaw);
+      if (found) { log.ok(`L2: ${found.code} (${found.status})`); return found; }
+
+      found = pool.find(c => normalizeCode(c.code).includes(targetNorm));
+      if (found) { log.ok(`L3: ${found.code} (${found.status})`); return found; }
+
+      found = pool.find(c => String(c.name).toUpperCase().includes(targetRaw));
+      if (found) { log.ok(`L4: ${found.code} (${found.status})`); return found; }
+
+      found = pool.find(c =>
+        String(c.name).toUpperCase().replace(/\s+/g, '').includes(targetNoSp)
+      );
+      if (found) { log.ok(`L5: ${found.code} (${found.status})`); return found; }
 
       const tokens = targetRaw.split(/\s+/).filter(t => t.length >= 3);
       if (tokens.length > 0) {
-        found = r.courses.find(c => {
+        found = pool.find(c => {
           const hay = `${c.code} ${c.name}`.toUpperCase();
           return tokens.every(t => hay.includes(t));
         });
-        if (found) { log.ok(`L6: ${found.code}`); return found; }
+        if (found) { log.ok(`L6: ${found.code} (${found.status})`); return found; }
       }
 
-      log.warn(`resolveTargetId: FAILED (${r.courses.length} courses)`);
+      log.warn(`resolveTargetId: FAILED for "${query}" (${pool.length} courses)`);
       return null;
     },
   };
@@ -925,20 +1145,28 @@ function sameCourse(a, b) {
 }
 
 async function verifyRegistrationStability(api, state) {
-  const r = await api.getCourses({ statuses: '3,4' });
+  const r = await api.getCourses();
   if (r.kind !== 'ok') return { kind: r.kind };
 
-  const currentReg = r.courses.map(c => ({ id: c.id, code: c.code, name: c.name }));
+  const currentReg = r.courses
+    .filter(c => Number(c.status) === 3 || Number(c.status) === 4)
+    .map(c => ({ id: c.id, code: c.code, name: c.name }));
 
   if (state.registeredCourses.length === 0) {
     state.registeredCourses = currentReg;
     log.ok(`Baseline set: ${currentReg.length} courses`);
+    log.ok(`   → ${currentReg.map(c => c.code).join(', ')}`);
     audit(state, 'baseline_set', { count: currentReg.length, codes: currentReg.map(c => c.code) });
+
     const missing = USER_CONFIG.expectedCourses.filter(exp =>
       !currentReg.some(c => normalizeCode(c.code).includes(normalizeCode(exp)))
     );
     if (missing.length > 0) {
-      await tgSend(`⚠️ <b>Baseline note</b>\nNot yet registered:\n${missing.map(m => `• ${escapeHtml(m)}`).join('\n')}\n\nSniper hunting. 🎯`);
+      await tgSend(
+        `⚠️ <b>Baseline note</b>\nNot yet registered:\n` +
+        missing.map(m => `• ${escapeHtml(m)}`).join('\n') +
+        `\n\nSniper is hunting. 🎯`
+      );
     }
     return { kind: 'ok' };
   }
@@ -948,7 +1176,11 @@ async function verifyRegistrationStability(api, state) {
       state.counters.drops++;
       log.err(`COURSE DROPPED: ${saved.code}`);
       audit(state, 'course_dropped', { code: saved.code });
-      await tgSend(`🚨 <b>Registration change!</b>\n❌ <b>${escapeHtml(saved.code)}</b> — ${escapeHtml(saved.name)}\n\nOpen DULMS!`);
+      await tgSend(
+        `🚨 <b>Registration change!</b>\n` +
+        `❌ <b>${escapeHtml(saved.code)}</b> — ${escapeHtml(saved.name)}\n\n` +
+        `Open DULMS immediately!`
+      );
     }
   }
   for (const curr of currentReg) {
@@ -968,11 +1200,17 @@ async function verifyRegistrationStability(api, state) {
 // ═══════════════════════════════════════════════════════════════════════════
 function filterMatchingGroups(groups, watched) {
   if (!Array.isArray(groups)) return [];
-  const available = groups.filter(g => g && g.available && typeof g.name === 'string' && g.name.length > 0);
+  const available = groups.filter(g =>
+    g && g.available && typeof g.name === 'string' && g.name.length > 0
+  );
   if (!Array.isArray(watched) || watched.length === 0) return available;
-  const w = watched.filter(x => typeof x === 'string' && x.length > 0).map(x => x.toUpperCase());
+  const w = watched
+    .filter(x => typeof x === 'string' && x.length > 0)
+    .map(x => x.toUpperCase());
   if (w.length === 0) return available;
-  return available.filter(g => w.some(pattern => String(g.name || '').toUpperCase().includes(pattern)));
+  return available.filter(g =>
+    w.some(pattern => String(g.name || '').toUpperCase().includes(pattern))
+  );
 }
 
 async function sniperCheck(api, state) {
@@ -993,28 +1231,59 @@ async function sniperCheck(api, state) {
   for (const [name, prev] of Object.entries(state.openGroupsState)) {
     if (prev.open && !currentlyOpen.has(name)) closed.push(name);
   }
-  for (const g of openGroups) state.openGroupsState[g.name] = { open: true, lastSeen: Date.now(), seats: g.seats, total: g.total };
-  for (const name of closed) { if (state.openGroupsState[name]) { state.openGroupsState[name].open = false; state.openGroupsState[name].seats = 0; } }
+
+  for (const g of openGroups) {
+    state.openGroupsState[g.name] = {
+      open: true, lastSeen: Date.now(), seats: g.seats, total: g.total,
+    };
+  }
+  for (const name of closed) {
+    if (state.openGroupsState[name]) {
+      state.openGroupsState[name].open = false;
+      state.openGroupsState[name].seats = 0;
+      state.openGroupsState[name].lastSeen = Date.now();
+    }
+  }
 
   if (newlyOpened.length > 0) {
     state.counters.opens += newlyOpened.length;
     state.counters.alertsSent++;
-    audit(state, 'target_open', { count: newlyOpened.length, groups: newlyOpened.map(g => g.name) });
+    audit(state, 'target_open', {
+      count: newlyOpened.length,
+      groups: newlyOpened.map(g => g.name),
+    });
+
     let msg = `🎉 <b>${escapeHtml(USER_CONFIG.targetCourse)} — ${newlyOpened.length} opened!</b>\n\n`;
     newlyOpened.slice(0, 8).forEach((g, i) => {
       msg += `<b>${i + 1}. ${escapeHtml(g.name)}</b> — 💺 ${g.seats}/${g.total}\n`;
-      if (g.slots[0]) msg += `   📅 ${escapeHtml(g.slots[0].day)} | ⏰ ${escapeHtml(g.slots[0].time)}\n`;
+      if (g.slots[0]) {
+        msg += `   📅 ${escapeHtml(g.slots[0].day)} | ⏰ ${escapeHtml(g.slots[0].time)}\n`;
+        if (g.slots[0].hall) msg += `   🏛 ${escapeHtml(g.slots[0].hall)}\n`;
+        if (g.slots[0].staff) msg += `   👤 ${escapeHtml(g.slots[0].staff)}\n`;
+      }
+      msg += `\n`;
     });
-    msg += `\n🔗 <b>Open DULMS NOW!</b>`;
-    await tgSend(msg, { silent: !USER_CONFIG.notifyWithSound });
+    msg += `🔗 <b>Open DULMS NOW!</b>`;
+
+    const btns = newlyOpened.slice(0, 3).map(g => ([{
+      text: `📝 Register ${g.name}`,
+      url: 'https://dulms.deltauniv.edu.eg/Registered/CoursesRegisteration',
+    }]));
+
+    await tgSend(msg, {
+      silent: !USER_CONFIG.notifyWithSound,
+      replyMarkup: btns.length ? { inline_keyboard: btns } : undefined,
+    });
     saveState(state);
   }
+
   if (closed.length > 0) {
     state.counters.closes += closed.length;
-    log.info(`Closed: ${closed.join(', ')}`);
+    log.info(`Groups closed: ${closed.join(', ')}`);
     audit(state, 'target_close', { groups: closed });
     saveState(state);
   }
+
   return { kind: 'open', groups: openGroups };
 }
 
@@ -1029,7 +1298,12 @@ async function detectChatMigration(state) {
     audit(state, 'chat_migration', { from: state.tgChatId, to: CONFIG.tgChatId });
     state.tgChatId = CONFIG.tgChatId;
     const regs = state.registeredCourses.map(c => `• ${escapeHtml(c.code)}`).join('\n') || '—';
-    await tgSend(`🔄 <b>Chat migration</b>\n\nBaseline (${state.registeredCourses.length}):\n${regs}\n\nTarget: <b>${escapeHtml(USER_CONFIG.targetCourse)}</b>`, { replyMarkup: MAIN_KEYBOARD });
+    await tgSend(
+      `🔄 <b>Chat migration synced</b>\n\n` +
+      `<b>Baseline (${state.registeredCourses.length}):</b>\n${regs}\n\n` +
+      `Target: <b>${escapeHtml(USER_CONFIG.targetCourse)}</b>`,
+      { replyMarkup: MAIN_KEYBOARD }
+    );
   }
 }
 
@@ -1041,30 +1315,53 @@ async function runScan(browser, deadline) {
     cleanupSession();
     await loginAndCaptureCookies(browser);
   }
+
   let context = await createRequestContext(browser, true);
-  let request = context.request;
-  let api = makeApi(request, browser);
+  let api = makeApi(context);   // ⭐ Pass context (has cookies)
 
   const state = loadState();
   state.startedAt = Date.now();
   if (USER_CONFIG.targetCourseId) state.targetCourseId = USER_CONFIG.targetCourseId;
+
   await detectChatMigration(state);
   saveState(state);
 
   const startupGapMs = USER_CONFIG.startupBriefHours * 60 * 60_000;
   if (Date.now() - state.startupBriefedAt > startupGapMs) {
     state.startupBriefedAt = Date.now();
-    await tgSend(`🚀 <b>Watcher v9.3 online</b>\n\n🎯 ${escapeHtml(USER_CONFIG.targetCourse)}\n🛡️ ${state.registeredCourses.length} courses\n\nSend /help.`, { replyMarkup: MAIN_KEYBOARD });
+    const missing = USER_CONFIG.expectedCourses.filter(exp =>
+      !state.registeredCourses.some(c => normalizeCode(c.code).includes(normalizeCode(exp)))
+    );
+    const missingTxt = missing.length
+      ? `\n⚠️ Waiting for: ${missing.map(escapeHtml).join(', ')}`
+      : `\n✅ All registered courses present`;
+    await tgSend(
+      `🚀 <b>Watcher v9.4 online</b>\n\n` +
+      `🎯 Sniping <b>${escapeHtml(USER_CONFIG.targetCourse)}</b> every 10s\n` +
+      `🎓 Mode: <b>lectures only</b>\n` +
+      `🛡️ Guarding <b>${state.registeredCourses.length}</b> courses${missingTxt}\n\n` +
+      `Send /help or use the buttons.`,
+      { replyMarkup: MAIN_KEYBOARD }
+    );
     saveState(state);
   }
 
-  log.step(`STARTED — Target: ${USER_CONFIG.targetCourse}`);
+  log.step(`STARTED — Target: ${USER_CONFIG.targetCourse} (lectures only)`);
 
-  const timers = { sniper: Date.now(), security: Date.now(), telegram: Date.now() + 2_000, memory: Date.now() + 60_000 };
+  const timers = {
+    sniper:   Date.now(),
+    security: Date.now(),
+    telegram: Date.now() + 2_000,
+    memory:   Date.now() + 60_000,
+  };
 
   while (Date.now() < deadline) {
     const now = Date.now();
-    if (state.paused) { await sleep(USER_CONFIG.heartbeatMs * 2); continue; }
+
+    if (state.paused) {
+      await sleep(USER_CONFIG.heartbeatMs * 2);
+      continue;
+    }
 
     if (now >= timers.telegram) {
       await handleTelegramCommands(state, api, timers);
@@ -1074,43 +1371,65 @@ async function runScan(browser, deadline) {
     if (now >= timers.memory) {
       const mb = rssMb();
       if (mb >= CONFIG.memRestartMb) {
-        log.err(`Memory critical (${mb} MB) — rebuild`);
+        log.err(`Memory critical (${mb} MB) — signaling rebuild`);
         audit(state, 'browser_restart', { rssMb: mb });
         saveState(state);
         try { await context.close(); } catch {}
         return RESULT.REBUILD;
+      } else if (mb >= CONFIG.memWarnMb) {
+        log.warn(`Memory high: ${mb} MB`);
       }
       timers.memory = Date.now() + 60_000;
     }
 
     if (now >= timers.security) {
       const sr = await verifyRegistrationStability(api, state);
+
       if (sr.kind === 'ok') {
         if (!state.targetCourseId) {
+          log.info(`Attempting target auto-resolution for "${USER_CONFIG.targetCourse}"...`);
           const resolved = await api.resolveTargetId(USER_CONFIG.targetCourse);
           if (resolved) {
             state.targetCourseId = resolved.id;
             state.targetCourseCode = resolved.code;
             state.targetCourseName = resolved.name;
             state.targetCourseStatus = resolved.status;
+            state.targetResolveFailures = 0;
             log.ok(`Target resolved: ${resolved.code} → ${resolved.id}`);
             audit(state, 'target_resolved', resolved);
-            await tgSend(`🎯 <b>Target resolved</b>\n\nCode: <code>${escapeHtml(resolved.code)}</code>\nStatus: ${statusLabel(resolved.status)}`);
+            await tgSend(
+              `🎯 <b>Target auto-resolved</b>\n\n` +
+              `Code: <code>${escapeHtml(resolved.code)}</code>\n` +
+              `Name: ${escapeHtml(resolved.name)}\n` +
+              `Status: ${statusLabel(resolved.status)}`
+            );
+          } else {
+            state.targetResolveFailures = (state.targetResolveFailures || 0) + 1;
+            log.warn(`Target resolution failed (${state.targetResolveFailures})`);
+            audit(state, 'target_resolve_failed', { attempts: state.targetResolveFailures });
+            if (state.targetResolveFailures === 3) {
+              await tgSend(
+                `⚠️ <b>Could not auto-resolve "${escapeHtml(USER_CONFIG.targetCourse)}"</b>\n\n` +
+                `Try:\n• <code>/diag</code>\n• <code>/find GEN</code>\n• <code>/target &lt;code&gt;</code>`
+              );
+            }
           }
         }
         timers.security = Date.now() + USER_CONFIG.securityIntervalMs;
         saveState(state);
       } else if (sr.kind === 'session_dead') {
-        log.warn('Security: session dead');
+        log.warn('Security: session dead — relogin');
+        audit(state, 'session_dead_security');
         state.counters.relogins++;
         try { await context.close(); } catch {}
         cleanupSession();
         await loginAndCaptureCookies(browser);
         context = await createRequestContext(browser, true);
-        request = context.request;
-        api = makeApi(request, browser);
+        api = makeApi(context);
         timers.security = Date.now() + 5_000;
+        saveState(state);
       } else {
+        log.warn(`Security check failed (${sr.kind}) — retry in 60s`);
         state.counters.errors++;
         timers.security = Date.now() + 60_000;
       }
@@ -1118,23 +1437,33 @@ async function runScan(browser, deadline) {
 
     if (state.targetCourseId && now >= timers.sniper) {
       const sr = await sniperCheck(api, state);
-      if (sr.kind === 'session_dead') {
-        state.counters.relogins++;
-        try { await context.close(); } catch {}
-        cleanupSession();
-        await loginAndCaptureCookies(browser);
-        context = await createRequestContext(browser, true);
-        request = context.request;
-        api = makeApi(request, browser);
-        timers.sniper = Date.now() + 5_000;
-      } else if (sr.kind === 'soft_server' || sr.kind === 'http') {
-        state.counters.errors++;
-        timers.sniper = Date.now() + 30_000;
-      } else if (sr.kind === 'structural') {
-        state.counters.errors++;
-        timers.sniper = Date.now() + 60_000;
-      } else {
-        timers.sniper = Date.now() + USER_CONFIG.sniperIntervalMs;
+      switch (sr.kind) {
+        case 'session_dead': {
+          log.warn('Sniper: session dead — relogin');
+          audit(state, 'session_dead_sniper');
+          state.counters.relogins++;
+          try { await context.close(); } catch {}
+          cleanupSession();
+          await loginAndCaptureCookies(browser);
+          context = await createRequestContext(browser, true);
+          api = makeApi(context);
+          timers.sniper = Date.now() + 5_000;
+          saveState(state);
+          break;
+        }
+        case 'soft_server':
+        case 'http':
+          state.counters.errors++;
+          timers.sniper = Date.now() + 30_000;
+          break;
+        case 'structural':
+          state.counters.errors++;
+          log.err('Sniper: structural response');
+          audit(state, 'structural_change');
+          timers.sniper = Date.now() + 60_000;
+          break;
+        default:
+          timers.sniper = Date.now() + USER_CONFIG.sniperIntervalMs;
       }
     }
 
@@ -1158,37 +1487,48 @@ function setupShutdownHandlers() {
     process.exit(0);
   };
   process.on('SIGTERM', () => handler('SIGTERM'));
-  process.on('SIGINT', () => handler('SIGINT'));
+  process.on('SIGINT',  () => handler('SIGINT'));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ENTRYPOINT
 // ═══════════════════════════════════════════════════════════════════════════
 (async () => {
-  if (!CONFIG.username || !CONFIG.password) { log.err('Missing credentials'); process.exit(1); }
+  if (!CONFIG.username || !CONFIG.password) {
+    log.err('Missing DULMS_USERNAME / DULMS_PASSWORD');
+    process.exit(1);
+  }
+
   setupShutdownHandlers();
 
   const startTs = Date.now();
   const deadline = startTs + CONFIG.durationMin * 60_000;
 
-  log.info(`Watcher v9.3 starting — PID ${process.pid}, RSS ${rssMb()} MB, deadline in ${CONFIG.durationMin} min`);
+  log.info(`Watcher v9.4 starting — PID ${process.pid}, RSS ${rssMb()} MB, deadline in ${CONFIG.durationMin} min`);
 
   await registerBotCommands();
 
   let iterations = 0;
-  while (Date.now() < deadline && iterations < 10) {
+  const maxIterations = 10;
+  while (Date.now() < deadline && iterations < maxIterations) {
     iterations++;
     const browser = await createBrowser();
     let result;
-    try { result = await runScan(browser, deadline); }
-    catch (e) { log.err('Fatal:', e.message); result = RESULT.FATAL; }
-    finally { try { await browser.close(); } catch {} }
+    try {
+      result = await runScan(browser, deadline);
+    } catch (e) {
+      log.err('Fatal:', e.message);
+      if (e.stack) console.error(e.stack);
+      result = RESULT.FATAL;
+    } finally {
+      try { await browser.close(); } catch {}
+    }
 
     if (result === RESULT.COMPLETED) { log.ok('Run completed'); break; }
-    if (result === RESULT.REBUILD) { log.info('Rebuilding…'); await sleep(2_000); continue; }
+    if (result === RESULT.REBUILD) { log.info('Rebuilding browser…'); await sleep(2_000); continue; }
     if (result === RESULT.FATAL) { log.err('Fatal — aborting'); break; }
   }
 
   try { saveState(loadState()); } catch {}
-  log.info(`Watcher v9.3 exiting — final RSS ${rssMb()} MB`);
+  log.info(`Watcher v9.4 exiting — final RSS ${rssMb()} MB`);
 })();
