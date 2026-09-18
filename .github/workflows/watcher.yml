@@ -1,4 +1,4 @@
-name: DULMS Watcher 24-7 (v10.2)
+name: DULMS Watcher 24-7 (v10.4)
 
 on:
   schedule:
@@ -35,11 +35,11 @@ jobs:
             .dulms-session.json
             .dulms-session-meta.json
             .dulms-audit.log
-          key: dulms-state-v102-${{ github.run_id }}
+          key: dulms-state-v104-${{ github.run_id }}
           restore-keys: |
+            dulms-state-v104-
+            dulms-state-v103-
             dulms-state-v102-
-            dulms-state-v100-
-            dulms-state-v95-
             dulms-session-
 
       - name: Restore state (artifact fallback)
@@ -47,7 +47,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: dulms-state-v102
+          name: dulms-state-v104
           path: .
 
       - name: Setup Node.js
@@ -77,6 +77,23 @@ jobs:
           NODE_OPTIONS:   '--max-old-space-size=1024'
         run: node watch.js
 
+      # ⭐ FIX #4: dump state on any failure for immediate diagnosis
+      - name: Dump state on failure
+        if: failure() || cancelled()
+        continue-on-error: true
+        run: |
+          echo "═══════════ Workspace ═══════════"
+          ls -la
+          echo ""
+          echo "═══════════ .dulms-state.json ═══════════"
+          cat .dulms-state.json 2>/dev/null || echo "(not found)"
+          echo ""
+          echo "═══════════ .dulms-session-meta.json ═══════════"
+          cat .dulms-session-meta.json 2>/dev/null || echo "(not found)"
+          echo ""
+          echo "═══════════ .dulms-audit.log (last 60 lines) ═══════════"
+          tail -n 60 .dulms-audit.log 2>/dev/null || echo "(not found)"
+
       - name: Save state (cache)
         if: always()
         continue-on-error: true
@@ -87,14 +104,14 @@ jobs:
             .dulms-session.json
             .dulms-session-meta.json
             .dulms-audit.log
-          key: dulms-state-v102-${{ github.run_id }}
+          key: dulms-state-v104-${{ github.run_id }}
 
       - name: Save state (artifact)
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: dulms-state-v102
+          name: dulms-state-v104
           path: |
             .dulms-state.json
             .dulms-session.json
