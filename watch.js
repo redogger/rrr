@@ -1,5 +1,13 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- *  DULMS Watcher v10.0 — Rapid 10s Early Detection
+ *  DULMS Watcher v10.2 — AJAX + 10s Early Detection
+ *  ---------------------------------------------------------------------------
+ *  Key design:
+ *   • Persistent authenticated page (opened once)
+ *   • AJAX interception to capture the FULL course list (13+ courses)
+ *   • Page reload every 10s to refresh AJAX (fast, authenticated)
+ *   • Early detection: checks every 10 seconds
+ *   • Sniper: checks every 10 seconds
+ *   • Security baseline: every 10 minutes
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 'use strict';
@@ -30,6 +38,9 @@ const USER_CONFIG = {
   startupBriefHours:        12,
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  RUNTIME CONFIG
+// ═══════════════════════════════════════════════════════════════════════════
 const CONFIG = {
   baseUrl:        'https://dulms.deltauniv.edu.eg',
   loginUrl:       'https://dulms.deltauniv.edu.eg/Login.aspx',
@@ -60,11 +71,14 @@ const CONFIG = {
   auditMaxBytes:   1 * 1024 * 1024,
 
   timezone:     'Africa/Cairo',
-  stateVersion: 100,
+  stateVersion: 102,
 };
 
 const RESULT = Object.freeze({ COMPLETED: 'completed', REBUILD: 'rebuild', FATAL: 'fatal' });
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  LOGGER
+// ═══════════════════════════════════════════════════════════════════════════
 const ts = () => new Date().toISOString().slice(11, 19);
 const log = {
   info: (...a) => console.log(`[${ts()}] [INFO]`, ...a),
@@ -75,6 +89,9 @@ const log = {
 };
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════
 function atomicWrite(file, data) {
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, typeof data === 'string' ? data : JSON.stringify(data, null, 2));
@@ -133,6 +150,9 @@ function timeSince(t) {
   return `${Math.floor(d/3600)}h ago`;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════════════════════════════════════
 function defaultState() {
   return {
     version:              CONFIG.stateVersion,
@@ -278,6 +298,9 @@ async function registerBotCommands() {
     log.ok(`Registered ${BOT_COMMANDS.length} commands`);
   } catch (e) { log.warn('Command registration failed:', e.message); }
 }
+// ═══════════════════════════════════════════════════════════════════════════
+//  TELEGRAM COMMANDS
+// ═══════════════════════════════════════════════════════════════════════════
 async function handleTelegramCommands(state, api) {
   if (!CONFIG.tgToken) return;
   try {
@@ -355,7 +378,7 @@ async function dispatchCommand(cmd, args, state, api) {
       const ed = state.earlyDetection || {};
       const openCount = Object.values(state.openGroupsState).filter(g => g.open).length;
       await tgSend(
-        `🟢 <b>Watcher v10.0</b>\n` +
+        `🟢 <b>Watcher v10.2</b>\n` +
         `⏱ <b>${uptimeMin} min</b> | 💾 <b>${rssMb()} MB</b> | ${state.paused ? '⏸ PAUSED' : '▶️ Running'}\n\n` +
         `🎯 Target: <b>${escapeHtml(USER_CONFIG.targetCourse)}</b> (${target})\n` +
         `📋 Status: ${state.targetCourseStatus != null ? statusLabel(state.targetCourseStatus) : '—'}\n` +
@@ -648,14 +671,59 @@ async function loginAndCaptureCookies(browser) {
   await ctx.close();
   log.ok('Logged in');
 }
+// ═══════════════════════════════════════════════════════════════════════════
+//  AJAX INTERCEPTION SETUP — persistent page captures the FULL course list
+// ═══════════════════════════════════════════════════════════════════════════
+async function setupAJAXInterception(ctx, pageRef) {
+  if (pageRef.page && !pageRef.page.isClosed()) {
+    try { await pageRef.page.close(); } catch {}
+  }
+
+  pageRef.page = await ctx.newPage();
+  pageRef.lastAJAX = null;
+  pageRef.ajaxTime = 0;
+
+  // ⭐ Capture the AJAX that DULMS fires on page load
+  pageRef.page.on('response', async (response) => {
+    const url = response.url();
+    if (url.includes('/Registered/GetStudentResiterationCourses')) {
+      try {
+        const json = await response.json();
+        if (Array.isArray(json) && json.length > 0) {
+          pageRef.lastAJAX = json;
+          pageRef.ajaxTime = Date.now();
+          log.ok(`Intercepted AJAX: ${json.length} courses`);
+        }
+      } catch (e) { /* not JSON */ }
+    }
+  });
+
+  // Navigate to trigger the AJAX
+  await pageRef.page.goto(CONFIG.coursesPageUrl, {
+    waitUntil: 'domcontentloaded',
+    timeout: 30_000,
+  }).catch((e) => log.warn('Page nav failed:', e.message));
+
+  // Wait for the AJAX to fire
+  for (let i = 0; i < 20 && !pageRef.lastAJAX; i++) {
+    await sleep(500);
+  }
+
+  if (pageRef.lastAJAX) {
+    log.ok(`AJAX ready: ${pageRef.lastAJAX.length} courses`);
+  } else {
+    log.warn('No AJAX captured yet');
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  API CLIENT — fetch inside authenticated page
+//  API CLIENT — uses intercepted AJAX + fetch in authenticated page
 // ═══════════════════════════════════════════════════════════════════════════
 function makeApi(ctx, pageRef) {
   let courseCache = { ts: 0, data: null };
   const CACHE_TTL = 8 * 1000;
 
+  // ⭐ Fetch directly from the authenticated page (for schedule & regInfo)
   async function fetchInPage(path, options = {}) {
     const result = await pageRef.page.evaluate(async ({ path, options }) => {
       try {
@@ -694,6 +762,23 @@ function makeApi(ctx, pageRef) {
   async function call(method, url, params) {
     const qs = params ? '?' + new URLSearchParams(params).toString() : '';
     return fetchInPage(url + qs, { method });
+  }
+
+  // ⭐ Reload page to trigger a fresh AJAX
+  async function triggerAjax() {
+    try {
+      if (!pageRef.page || pageRef.page.isClosed()) {
+        await setupAJAXInterception(ctx, pageRef);
+        return;
+      }
+      pageRef.lastAJAX = null;
+      await pageRef.page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => {});
+      for (let i = 0; i < 20 && !pageRef.lastAJAX; i++) {
+        await sleep(500);
+      }
+    } catch (e) {
+      log.warn('triggerAjax failed:', e.message);
+    }
   }
 
   return {
@@ -735,10 +820,43 @@ function makeApi(ctx, pageRef) {
       return { kind: 'ok', groups: list };
     },
 
+    // ⭐⭐⭐ KEY FUNCTION — uses intercepted AJAX for FULL list
     async getCourses({ forceRefresh = false } = {}) {
       if (!forceRefresh && courseCache.data && Date.now() - courseCache.ts < CACHE_TTL) {
         return { kind: 'ok', courses: courseCache.data };
       }
+
+      // Priority 1: Fresh AJAX data (within 60s)
+      if (pageRef.lastAJAX && Array.isArray(pageRef.lastAJAX) && pageRef.lastAJAX.length > 0 &&
+          Date.now() - pageRef.ajaxTime < 60_000) {
+        const list = pageRef.lastAJAX.map(c => ({
+          id: String(c.CourseId),
+          code: c.Code || '',
+          name: c.Name || '',
+          status: c.GradeStatusId,
+          group: c.GrpName,
+        }));
+        courseCache = { ts: Date.now(), data: list };
+        return { kind: 'ok', courses: list };
+      }
+
+      // Priority 2: Reload to trigger fresh AJAX
+      await triggerAjax();
+
+      if (pageRef.lastAJAX && Array.isArray(pageRef.lastAJAX) && pageRef.lastAJAX.length > 0) {
+        const list = pageRef.lastAJAX.map(c => ({
+          id: String(c.CourseId),
+          code: c.Code || '',
+          name: c.Name || '',
+          status: c.GradeStatusId,
+          group: c.GrpName,
+        }));
+        courseCache = { ts: Date.now(), data: list };
+        return { kind: 'ok', courses: list };
+      }
+
+      // Priority 3: Direct fetch fallback
+      log.warn('getCourses: AJAX failed, using direct fetch');
       const r = await fetchInPage(
         CONFIG.API.coursesList +
         '?GradeStatusIds=0,1,2,3,4,5&GroupsIds=-1&IsVirtualRegisteration=false'
@@ -782,8 +900,9 @@ function makeApi(ctx, pageRef) {
     },
   };
 }
+
 // ═══════════════════════════════════════════════════════════════════════════
-//  EARLY DETECTION
+//  EARLY DETECTION — watches for target course to appear
 // ═══════════════════════════════════════════════════════════════════════════
 async function earlyDetectionCheck(api, state) {
   if (!state.earlyDetection?.enabled) return { found: false };
@@ -846,7 +965,7 @@ async function earlyDetectionCheck(api, state) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  SECURITY
+//  SECURITY — baseline guard (detect drops/adds)
 // ═══════════════════════════════════════════════════════════════════════════
 function sameCourse(a, b) {
   if (a.id && b.id) return String(a.id) === String(b.id);
@@ -887,7 +1006,7 @@ async function verifyRegistrationStability(api, state) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  SNIPER
+//  SNIPER — watches open groups of the target
 // ═══════════════════════════════════════════════════════════════════════════
 function filterMatchingGroups(groups, watched) {
   if (!Array.isArray(groups)) return [];
@@ -948,7 +1067,6 @@ async function sniperCheck(api, state) {
 
   return { kind: 'open', groups: openGroups };
 }
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  MAIN LOOP
 // ═══════════════════════════════════════════════════════════════════════════
@@ -960,11 +1078,9 @@ async function runScan(browser, deadline) {
 
   let ctx = await createAuthContext(browser, true);
 
-  // Persistent page — opened once
-  const pageRef = { page: null };
-  pageRef.page = await ctx.newPage();
-  await pageRef.page.goto(CONFIG.coursesPageUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
-    .catch((e) => log.warn('Page nav failed:', e.message));
+  // ⭐ Persistent page with AJAX interception
+  const pageRef = { page: null, lastAJAX: null, ajaxTime: 0 };
+  await setupAJAXInterception(ctx, pageRef);
 
   let api = makeApi(ctx, pageRef);
 
@@ -972,6 +1088,7 @@ async function runScan(browser, deadline) {
   state.startedAt = Date.now();
   if (!state.earlyDetection) state.earlyDetection = defaultState().earlyDetection;
 
+  // Chat migration
   if (!state.tgChatId) state.tgChatId = CONFIG.tgChatId;
   else if (state.tgChatId !== CONFIG.tgChatId) {
     state.tgChatId = CONFIG.tgChatId;
@@ -979,11 +1096,12 @@ async function runScan(browser, deadline) {
   }
   saveState(state);
 
+  // Startup brief (throttled)
   const startupGapMs = USER_CONFIG.startupBriefHours * 60 * 60_000;
   if (Date.now() - state.startupBriefedAt > startupGapMs) {
     state.startupBriefedAt = Date.now();
     await tgSend(
-      `🚀 <b>Watcher v10.0</b>\n\n` +
+      `🚀 <b>Watcher v10.2</b>\n\n` +
       `🎯 Sniping <b>${escapeHtml(USER_CONFIG.targetCourse)}</b>\n` +
       `🕐 Early Detection: <b>ON — every 10s</b>\n` +
       `🛡️ Guarding <b>${state.registeredCourses.length}</b> courses\n\n` +
@@ -1008,11 +1126,13 @@ async function runScan(browser, deadline) {
     const now = Date.now();
     if (state.paused) { await sleep(1000); continue; }
 
+    // ── Telegram ───────────────────────────────────────────────────
     if (now >= timers.telegram) {
       await handleTelegramCommands(state, api);
       timers.telegram = Date.now() + USER_CONFIG.telegramPollMs;
     }
 
+    // ── Memory watchdog ─────────────────────────────────────────────
     if (now >= timers.memory) {
       const mb = rssMb();
       if (mb >= CONFIG.memRestartMb) {
@@ -1020,17 +1140,18 @@ async function runScan(browser, deadline) {
         saveState(state);
         try { await ctx.close(); } catch {}
         return RESULT.REBUILD;
+      } else if (mb >= CONFIG.memWarnMb) {
+        log.warn(`Memory high: ${mb} MB`);
       }
       timers.memory = Date.now() + 60_000;
     }
 
+    // ── Page health check ───────────────────────────────────────────
     if (now >= timers.pageHealth) {
       try {
-        const isClosed = pageRef.page.isClosed();
-        if (isClosed) {
+        if (!pageRef.page || pageRef.page.isClosed()) {
           log.warn('Page closed — reopening…');
-          pageRef.page = await ctx.newPage();
-          await pageRef.page.goto(CONFIG.coursesPageUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+          await setupAJAXInterception(ctx, pageRef);
           api = makeApi(ctx, pageRef);
         }
       } catch (e) {
@@ -1039,7 +1160,7 @@ async function runScan(browser, deadline) {
       timers.pageHealth = Date.now() + 30_000;
     }
 
-    // EARLY DETECTION every 10s
+    // ── ⭐ EARLY DETECTION (every 10s) ─────────────────────────────
     if (!state.targetCourseId && state.earlyDetection.enabled && now >= timers.earlyDetection) {
       try {
         const ed = await earlyDetectionCheck(api, state);
@@ -1051,7 +1172,7 @@ async function runScan(browser, deadline) {
       saveState(state);
     }
 
-    // Security every 10 min
+    // ── Security baseline (every 10 min) ────────────────────────────
     if (now >= timers.security) {
       try {
         const sr = await verifyRegistrationStability(api, state);
@@ -1062,8 +1183,7 @@ async function runScan(browser, deadline) {
           cleanupSession();
           await loginAndCaptureCookies(browser);
           ctx = await createAuthContext(browser, true);
-          pageRef.page = await ctx.newPage();
-          await pageRef.page.goto(CONFIG.coursesPageUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+          await setupAJAXInterception(ctx, pageRef);
           api = makeApi(ctx, pageRef);
           timers.security = Date.now() + 5_000;
         } else if (sr.kind === 'ok') {
@@ -1079,7 +1199,7 @@ async function runScan(browser, deadline) {
       }
     }
 
-    // Sniper every 10s
+    // ── Sniper (every 10s, after target resolved) ───────────────────
     if (state.targetCourseId && now >= timers.sniper) {
       try {
         const sr = await sniperCheck(api, state);
@@ -1090,8 +1210,7 @@ async function runScan(browser, deadline) {
           cleanupSession();
           await loginAndCaptureCookies(browser);
           ctx = await createAuthContext(browser, true);
-          pageRef.page = await ctx.newPage();
-          await pageRef.page.goto(CONFIG.coursesPageUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+          await setupAJAXInterception(ctx, pageRef);
           api = makeApi(ctx, pageRef);
           timers.sniper = Date.now() + 5_000;
         } else if (sr.kind === 'soft_server' || sr.kind === 'http') {
@@ -1114,7 +1233,7 @@ async function runScan(browser, deadline) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  SHUTDOWN
+//  GRACEFUL SHUTDOWN
 // ═══════════════════════════════════════════════════════════════════════════
 let shuttingDown = false;
 function setupShutdownHandlers() {
@@ -1133,24 +1252,34 @@ function setupShutdownHandlers() {
 //  ENTRYPOINT
 // ═══════════════════════════════════════════════════════════════════════════
 (async () => {
-  if (!CONFIG.username || !CONFIG.password) { log.err('Missing credentials'); process.exit(1); }
+  if (!CONFIG.username || !CONFIG.password) {
+    log.err('Missing DULMS_USERNAME / DULMS_PASSWORD');
+    process.exit(1);
+  }
   setupShutdownHandlers();
 
   const startTs = Date.now();
   const deadline = startTs + CONFIG.durationMin * 60_000;
 
-  log.info(`Watcher v10.0 — PID ${process.pid}, RSS ${rssMb()} MB, ${CONFIG.durationMin} min`);
+  log.info(`Watcher v10.2 — PID ${process.pid}, RSS ${rssMb()} MB, ${CONFIG.durationMin} min`);
 
   await registerBotCommands();
 
   let iter = 0;
-  while (Date.now() < deadline && iter < 10) {
+  const maxIter = 10;
+  while (Date.now() < deadline && iter < maxIter) {
     iter++;
     const browser = await createBrowser();
     let result;
-    try { result = await runScan(browser, deadline); }
-    catch (e) { log.err('Fatal:', e.message); if (e.stack) console.error(e.stack); result = RESULT.FATAL; }
-    finally { try { await browser.close(); } catch {} }
+    try {
+      result = await runScan(browser, deadline);
+    } catch (e) {
+      log.err('Fatal:', e.message);
+      if (e.stack) console.error(e.stack);
+      result = RESULT.FATAL;
+    } finally {
+      try { await browser.close(); } catch {}
+    }
 
     if (result === RESULT.COMPLETED) { log.ok('Run completed'); break; }
     if (result === RESULT.REBUILD) { log.info('Rebuilding…'); await sleep(2_000); continue; }
