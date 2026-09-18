@@ -1,7 +1,7 @@
 {
   "name": "dulms-watcher",
-  "version": "9.1.0",
-  "description": "English Sniper Edition — DULMS Watcher",
+  "version": "9.4.0",
+  "description": "DULMS Watcher — Authenticated Context Edition with AJAX interception",
   "main": "watch.js",
   "scripts": {
     "start": "node watch.js"
