@@ -1,7 +1,7 @@
 {
   "name": "dulms-watcher",
-  "version": "10.2.1",
-  "description": "DULMS Watcher — AJAX + 10s Early Detection (modular)",
+  "version": "10.4.0",
+  "description": "DULMS Watcher — AJAX + 10s Early Detection (v10.4 hardened)",
   "main": "watch.js",
   "scripts": {
     "start": "node watch.js"
