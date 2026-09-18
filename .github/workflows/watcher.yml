@@ -1,4 +1,4 @@
-name: DULMS Watcher 24-7 (v9.0)
+name: DULMS Watcher 24-7 (v9.1)
 
 on:
   schedule:
@@ -27,7 +27,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── Restore state from cache ──
       - name: Restore state (cache)
         uses: actions/cache/restore@v4
         with:
@@ -36,20 +35,19 @@ jobs:
             .dulms-session.json
             .dulms-session-meta.json
             .dulms-audit.log
-          key: dulms-state-v9-${{ github.run_id }}
+          key: dulms-state-v91-${{ github.run_id }}
           restore-keys: |
+            dulms-state-v91-
             dulms-state-v9-
             dulms-state-v8-
-            dulms-state-v7-
             dulms-session-
 
-      # ── Fallback: from artifact ──
       - name: Restore state (artifact fallback)
         if: hashFiles('.dulms-state.json') == ''
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: dulms-state-v9
+          name: dulms-state-v91
           path: .
 
       - name: Setup Node.js
@@ -63,7 +61,6 @@ jobs:
       - name: Install Chromium
         run: npx playwright install chromium --with-deps
 
-      # ── Run ──
       - name: Run watcher
         env:
           DULMS_USERNAME: ${{ secrets.DULMS_USERNAME }}
@@ -74,7 +71,6 @@ jobs:
           NODE_OPTIONS:   '--max-old-space-size=1024'
         run: node watch.js
 
-      # ── Persist ──
       - name: Save state (cache)
         if: always()
         uses: actions/cache/save@v4
@@ -84,13 +80,13 @@ jobs:
             .dulms-session.json
             .dulms-session-meta.json
             .dulms-audit.log
-          key: dulms-state-v9-${{ github.run_id }}
+          key: dulms-state-v91-${{ github.run_id }}
 
       - name: Save state (artifact backup)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dulms-state-v9
+          name: dulms-state-v91
           path: |
             .dulms-state.json
             .dulms-session.json
@@ -99,7 +95,6 @@ jobs:
           overwrite: true
           if-no-files-found: ignore
 
-      # ── Relay ──
       - name: Relay next run
         if: always()
         run: |
