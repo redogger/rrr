@@ -700,24 +700,35 @@ function makeApi(request) {
         if (item.Type !== 'Group') continue;
         const gid = item.GroupId;
         if (!groups[gid]) {
-          // ⭐ ShortName-GroupName merging for university groups
-          const displayName = item.IsUniversity && item.ShortName
-            ? `${item.ShortName}-${item.GroupName}`
-            : item.GroupName;
+  // ⭐ Safe display name — always a non-empty string
+  const rawName = String(item.GroupName || '').trim();
+  const shortName = String(item.ShortName || '').trim();
+  const isUni = !!item.IsUniversity;
 
-          groups[gid] = {
-            id: gid,
-            name: displayName,
-            rawName: item.GroupName,
-            shortName: item.ShortName,
-            isUniversity: !!item.IsUniversity,
-            blocked: !!item.IsBlocked,
-            selected: !!item.IsSelected,
-            total: parseInt(item.StudentsCount) || 0,
-            registered: parseInt(item.RegisteredCount) || 0,
-            slots: [],
-          };
-        }
+  let displayName;
+  if (isUni && shortName && rawName) {
+    displayName = `${shortName}-${rawName}`;
+  } else if (rawName) {
+    displayName = rawName;
+  } else if (shortName) {
+    displayName = `${shortName}-${gid}`;
+  } else {
+    displayName = `Group-${gid}`;
+  }
+
+  groups[gid] = {
+    id: gid,
+    name: displayName,
+    rawName: rawName || null,
+    shortName: shortName || null,
+    isUniversity: isUni,
+    blocked: !!item.IsBlocked,
+    selected: !!item.IsSelected,
+    total: parseInt(item.StudentsCount) || 0,
+    registered: parseInt(item.RegisteredCount) || 0,
+    slots: [],
+  };
+}
         groups[gid].slots.push({
           day: item.DayWeekName,
           time: item.Time,
@@ -875,12 +886,21 @@ async function verifyRegistrationStability(api, state) {
 //  SNIPER TASK — per-group tracking
 // ═══════════════════════════════════════════════════════════════════════════
 function filterMatchingGroups(groups, watched) {
-  const available = groups.filter(g => g.available);
-  if (!watched || watched.length === 0) return available;
-  const w = watched.map(x => x.toUpperCase());
-  return available.filter(g =>
-    w.some(pattern => g.name.toUpperCase().includes(pattern))
+  if (!Array.isArray(groups)) return [];
+  const available = groups.filter(g =>
+    g && g.available && typeof g.name === 'string' && g.name.length > 0
   );
+  if (!Array.isArray(watched) || watched.length === 0) return available;
+
+  const w = watched
+    .filter(x => typeof x === 'string' && x.length > 0)
+    .map(x => x.toUpperCase());
+  if (w.length === 0) return available;
+
+  return available.filter(g => {
+    const name = String(g.name || '').toUpperCase();
+    return w.some(pattern => name.includes(pattern));
+  });
 }
 
 async function sniperCheck(api, state) {
@@ -898,13 +918,15 @@ async function sniperCheck(api, state) {
   }
 
   // Detect NEWLY opened (was closed → now open)
-  const newlyOpened = [];
-  for (const g of openGroups) {
-    const prev = state.openGroupsState[g.name];
-    if (!prev || !prev.open) {
-      newlyOpened.push(g);
-    }
+  // Detect NEWLY opened (was closed → now open)
+const newlyOpened = [];
+for (const g of openGroups) {
+  if (!g || typeof g.name !== 'string' || g.name.length === 0) continue;
+  const prev = state.openGroupsState[g.name];
+  if (!prev || !prev.open) {
+    newlyOpened.push(g);
   }
+}
 
   // Detect CLOSED (was open → now closed)
   const closed = [];
