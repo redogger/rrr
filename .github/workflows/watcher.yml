@@ -73,6 +73,7 @@ jobs:
 
       - name: Save state (cache)
         if: always()
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: |
@@ -84,6 +85,7 @@ jobs:
 
       - name: Save state (artifact)
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: dulms-state-v100
@@ -97,6 +99,7 @@ jobs:
 
       - name: Relay next run
         if: always()
+        continue-on-error: true
         run: |
           sleep 5
           gh workflow run watcher.yml --ref "${GITHUB_REF_NAME}" \
