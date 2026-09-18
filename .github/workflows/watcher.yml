@@ -2,7 +2,6 @@ name: DULMS Watcher 24-7
 
 on:
   schedule:
-    # جدول أمان احتياطي كل ساعة لإعادة الإقلاع إذا توقفت السلسلة
     - cron: '0 * * * *'
   workflow_dispatch:
 
@@ -74,7 +73,6 @@ jobs:
           overwrite: true
           if-no-files-found: ignore
 
-      # سر الاستمرار 24/7: استدعاء الجلسة القادمة فوراً لتستلم الراية
       - name: Trigger next relay run (24/7 Handshake)
         if: always()
         run: |
