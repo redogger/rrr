@@ -1,7 +1,7 @@
 {
   "name": "dulms-watcher",
-  "version": "4.0.0",
-  "description": "DULMS Course Watcher v4.0 - Smart Dedup + Cookie-First + Always-Notify",
+  "version": "4.5.0",
+  "description": "24/7 Autonomous Course Watcher for DULMS with Smart Session Management",
   "main": "watch.js",
   "scripts": {
     "start": "node watch.js",
