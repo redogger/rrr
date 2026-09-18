@@ -1,7 +1,7 @@
 {
   "name": "dulms-watcher",
-  "version": "4.5.0",
-  "description": "24/7 Autonomous Course Watcher for DULMS with Smart Session Management",
+  "version": "5.0.0",
+  "description": "Personal Guard & Targeted Course Sniper for DULMS",
   "main": "watch.js",
   "scripts": {
     "start": "node watch.js",
