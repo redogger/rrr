@@ -209,7 +209,7 @@ async function verifyRegistrationStability(page, state) {
 async function checkCourse(page, id) {
   try {
     const r = await page.evaluate(async (cid) => {
-      const res = await fetch('/Registered/GetCourseSchedual?CourseId=' + encodeURIComponent(cid));
+      const res = await fetch('https://dulms.deltauniv.edu.eg/Registered/GetCourseSchedual?CourseId=' + encodeURIComponent(cid));
       if (!res.ok) return { error: 'http' };
       const raw = (await res.text()).trim();
       if (raw === '-1' || raw.charAt(0) === '<') return { sessionDead: true };
