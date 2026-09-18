@@ -1,9 +1,14 @@
-name: DULMS Watcher 24-7
+name: DULMS Watcher 24-7 (v9.0)
 
 on:
   schedule:
     - cron: '0 * * * *'
   workflow_dispatch:
+    inputs:
+      duration_min:
+        description: 'Run duration in minutes'
+        required: false
+        default: '50'
 
 concurrency:
   group: dulms-watcher-relay
@@ -19,19 +24,33 @@ jobs:
     timeout-minutes: 65
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Restore state and session
+      # ── Restore state from cache ──
+      - name: Restore state (cache)
         uses: actions/cache/restore@v4
         with:
           path: |
             .dulms-state.json
             .dulms-session.json
             .dulms-session-meta.json
-          key: dulms-session-${{ github.run_id }}
+            .dulms-audit.log
+          key: dulms-state-v9-${{ github.run_id }}
           restore-keys: |
+            dulms-state-v9-
+            dulms-state-v8-
+            dulms-state-v7-
             dulms-session-
+
+      # ── Fallback: from artifact ──
+      - name: Restore state (artifact fallback)
+        if: hashFiles('.dulms-state.json') == ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: dulms-state-v9
+          path: .
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -41,19 +60,22 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Install Chromium with system dependencies
+      - name: Install Chromium
         run: npx playwright install chromium --with-deps
 
-      - name: Run DULMS Watcher Loop (50 Minutes)
+      # ── Run ──
+      - name: Run watcher
         env:
           DULMS_USERNAME: ${{ secrets.DULMS_USERNAME }}
           DULMS_PASSWORD: ${{ secrets.DULMS_PASSWORD }}
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          DURATION_MIN: '50'
+          TG_TOKEN:       ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID:     ${{ secrets.TG_CHAT_ID }}
+          DURATION_MIN:   ${{ github.event.inputs.duration_min || '50' }}
+          NODE_OPTIONS:   '--max-old-space-size=1024'
         run: node watch.js
 
-      - name: Save session state to Cache
+      # ── Persist ──
+      - name: Save state (cache)
         if: always()
         uses: actions/cache/save@v4
         with:
@@ -61,22 +83,29 @@ jobs:
             .dulms-state.json
             .dulms-session.json
             .dulms-session-meta.json
-          key: dulms-session-${{ github.run_id }}
+            .dulms-audit.log
+          key: dulms-state-v9-${{ github.run_id }}
 
-      - name: Backup state to Artifacts
+      - name: Save state (artifact backup)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dulms-state-backup
-          path: .dulms-state.json
-          retention-days: 7
+          name: dulms-state-v9
+          path: |
+            .dulms-state.json
+            .dulms-session.json
+            .dulms-session-meta.json
+          retention-days: 14
           overwrite: true
           if-no-files-found: ignore
 
-      - name: Trigger next relay run (24/7 Handshake)
+      # ── Relay ──
+      - name: Relay next run
         if: always()
         run: |
-          echo "Triggering next relay execution..."
-          gh workflow run watcher.yml --ref main || true
+          sleep 5
+          gh workflow run watcher.yml --ref "${GITHUB_REF_NAME}" \
+            || gh workflow run watcher.yml --ref main \
+            || true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
