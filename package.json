@@ -1,7 +1,7 @@
 {
   "name": "dulms-watcher",
-  "version": "5.0.0",
-  "description": "Personal Guard & Targeted Course Sniper for DULMS",
+  "version": "9.0.0",
+  "description": "Fortress Edition — API-First Intelligent Sniper & Personal Guard for DULMS",
   "main": "watch.js",
   "scripts": {
     "start": "node watch.js",
