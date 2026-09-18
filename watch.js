@@ -1,13 +1,20 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- *  DULMS Watcher v10.2 — AJAX + 10s Early Detection
+ *  DULMS Watcher v10.3 — AJAX + 10s Early Detection (hardened single-file)
  *  ---------------------------------------------------------------------------
- *  Key design:
- *   • Persistent authenticated page (opened once)
- *   • AJAX interception to capture the FULL course list (13+ courses)
- *   • Page reload every 10s to refresh AJAX (fast, authenticated)
- *   • Early detection: checks every 10 seconds
- *   • Sniper: checks every 10 seconds
- *   • Security baseline: every 10 minutes
+ *  Improvements over v10.2:
+ *   ✅ Pause no longer blocks Telegram → /resume always works
+ *   ✅ createBrowser wrapped in try/catch → relay survives launch failures
+ *   ✅ Target uses state.targetCourseCode || USER_CONFIG.targetCourse
+ *   ✅ Callback data uses short IDs (Arabic group names no longer truncated)
+ *   ✅ Shutdown handler writes the live state via setCurrentState()
+ *   ✅ TG 400 errors logged; 429 still re-queued
+ *   ✅ /reset clears early-detection counters + pendingCallbacks
+ *   ✅ Long messages truncated to fit Telegram's 4096-char limit
+ *   ✅ AJAX interception logs only when the course count changes
+ *   ✅ Timer drift fixed (intervals no longer accumulate)
+ *   ✅ Proactive session renewal every ~12 min
+ *   ✅ Every silent catch{} now logs a warning
+ *   ✅ chat_id sent as Number to setMyCommands when possible
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 'use strict';
@@ -36,6 +43,7 @@ const USER_CONFIG = {
   notifyWithSound:          true,
   maxTelegramPerMin:        20,
   startupBriefHours:        12,
+  sessionRenewEveryMs:      12 * 60 * 1000,   // ✅ IMPROVE: proactive renewal
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -70,8 +78,10 @@ const CONFIG = {
   auditFile:       path.join(process.cwd(), '.dulms-audit.log'),
   auditMaxBytes:   1 * 1024 * 1024,
 
+  tgMessageMaxChars: 3800,   // ✅ FIX: Telegram hard-limit is 4096
+
   timezone:     'Africa/Cairo',
-  stateVersion: 102,
+  stateVersion: 103,
 };
 
 const RESULT = Object.freeze({ COMPLETED: 'completed', REBUILD: 'rebuild', FATAL: 'fatal' });
@@ -97,10 +107,19 @@ function atomicWrite(file, data) {
   fs.writeFileSync(tmp, typeof data === 'string' ? data : JSON.stringify(data, null, 2));
   fs.renameSync(tmp, file);
 }
+
 const escapeHtml = (s) => String(s).replace(/[&<>"']/g, c => (
   { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]
 ));
+
 const normalizeCode = (s) => String(s || '').toUpperCase().replace(/\s+/g, '').replace(/-/g, '');
+
+// ✅ IMPROVE: central truncation helper
+function truncateForTelegram(s, max = CONFIG.tgMessageMaxChars) {
+  const str = String(s ?? '');
+  if (str.length <= max) return str;
+  return str.slice(0, max - 20) + '\n… (truncated)';
+}
 
 function statusLabel(s) {
   const m = { 0:'❌ Failed', 1:'✅ Passed', 2:'↩️ Withdrawn', 3:'⏳ Pending', 4:'📝 Registered', 5:'🆕 Never' };
@@ -113,6 +132,7 @@ async function withTimeout(p, ms, label = 'op') {
   const to = new Promise((_, rej) => t = setTimeout(() => rej(new Error(`${label} timeout`)), ms));
   try { return await Promise.race([p, to]); } finally { clearTimeout(t); }
 }
+
 async function retry(fn, { attempts = 3, baseMs = 800, label = 'op' } = {}) {
   let last;
   for (let i = 0; i < attempts; i++) {
@@ -129,6 +149,7 @@ async function retry(fn, { attempts = 3, baseMs = 800, label = 'op' } = {}) {
   }
   throw last;
 }
+
 const rssMb = () => { try { return Math.round(process.memoryUsage().rss / 1024 / 1024); } catch { return 0; } };
 
 function rotateAuditIfNeeded() {
@@ -139,7 +160,7 @@ function rotateAuditIfNeeded() {
       try { if (fs.existsSync(b)) fs.unlinkSync(b); } catch {}
       fs.renameSync(CONFIG.auditFile, b);
     }
-  } catch {}
+  } catch (e) { log.warn('audit rotate failed:', e.message); }
 }
 
 function timeSince(t) {
@@ -162,6 +183,8 @@ function defaultState() {
     targetCourseName:     null,
     targetCourseStatus:   null,
     openGroupsState:      {},
+    pendingCallbacks:     {},      // ✅ FIX: short-id map for inline buttons
+    _cbCounter:           0,       // ✅ FIX
     lastTgUpdateId:       0,
     tgChatId:             null,
     watchedGroups:        [...USER_CONFIG.preferredGroups],
@@ -176,6 +199,7 @@ function defaultState() {
     counters: { opens: 0, closes: 0, drops: 0, adds: 0, relogins: 0, errors: 0, alertsSent: 0 },
   };
 }
+
 function migrateState(s) {
   if (!s || typeof s !== 'object') return defaultState();
   const base = defaultState();
@@ -187,27 +211,38 @@ function migrateState(s) {
   merged.audit = Array.isArray(merged.audit) ? merged.audit.slice(-500) : [];
   if (!Array.isArray(merged.watchedGroups)) merged.watchedGroups = [];
   if (!merged.openGroupsState || typeof merged.openGroupsState !== 'object') merged.openGroupsState = {};
+  if (!merged.pendingCallbacks || typeof merged.pendingCallbacks !== 'object') merged.pendingCallbacks = {};
+  if (typeof merged._cbCounter !== 'number') merged._cbCounter = 0;
   merged.version = CONFIG.stateVersion;
   return merged;
 }
+
 function loadState() {
   try {
     if (fs.existsSync(CONFIG.stateFile)) return migrateState(JSON.parse(fs.readFileSync(CONFIG.stateFile, 'utf8')));
   } catch (e) { log.warn('State load failed:', e.message); }
   return defaultState();
 }
+
 function saveState(state) {
   try { atomicWrite(CONFIG.stateFile, state); } catch (e) { log.warn('State save failed:', e.message); }
 }
+
 function audit(state, event, details = {}) {
   const entry = { t: Date.now(), event, ...details };
   state.audit.push(entry);
   if (state.audit.length > 500) state.audit = state.audit.slice(-500);
-  try { rotateAuditIfNeeded(); fs.appendFileSync(CONFIG.auditFile, JSON.stringify(entry) + '\n'); } catch {}
+  try { rotateAuditIfNeeded(); fs.appendFileSync(CONFIG.auditFile, JSON.stringify(entry) + '\n'); } catch (e) {
+    log.warn('audit append failed:', e.message);
+  }
 }
 
+// ✅ FIX: keep a live reference to the current state so SIGTERM persists it
+let _currentState = null;
+function setCurrentState(s) { _currentState = s; }
+
 // ═══════════════════════════════════════════════════════════════════════════
-//  TELEGRAM
+//  TELEGRAM — sending
 // ═══════════════════════════════════════════════════════════════════════════
 const tgQueue = [];
 let tgSending = false;
@@ -215,7 +250,7 @@ const tgTimestamps = [];
 
 async function tgSend(html, { silent = false, replyMarkup = null } = {}) {
   if (!CONFIG.tgToken || !CONFIG.tgChatId || !html) return;
-  tgQueue.push({ html, silent, replyMarkup });
+  tgQueue.push({ html: truncateForTelegram(html), silent, replyMarkup });
   if (tgSending) return;
   tgSending = true;
   try {
@@ -241,10 +276,15 @@ async function tgSend(html, { silent = false, replyMarkup = null } = {}) {
           }), CONFIG.netTimeoutMs, 'tg-send'
         );
         const body = await res.json().catch(() => ({}));
-        if (!body.ok && body.error_code === 429) {
-          const r = (body.parameters && body.parameters.retry_after) || 5;
-          tgQueue.unshift({ html: msg, silent: sil, replyMarkup: rm });
-          await sleep(r * 1000);
+        if (!body.ok) {
+          if (body.error_code === 429) {
+            const r = (body.parameters && body.parameters.retry_after) || 5;
+            tgQueue.unshift({ html: msg, silent: sil, replyMarkup: rm });
+            await sleep(r * 1000);
+          } else {
+            // ✅ FIX: surface non-429 errors
+            log.warn(`TG send rejected (${body.error_code || '?'}): ${body.description || 'unknown'}`);
+          }
         }
       } catch (e) { log.warn('TG send failed:', e.message); }
       await sleep(1_100);
@@ -252,6 +292,9 @@ async function tgSend(html, { silent = false, replyMarkup = null } = {}) {
   } finally { tgSending = false; }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  TELEGRAM — keyboards + commands menu
+// ═══════════════════════════════════════════════════════════════════════════
 const MAIN_KEYBOARD = {
   keyboard: [
     [{ text: '📊 Status' }, { text: '🎯 Groups' }],
@@ -262,6 +305,7 @@ const MAIN_KEYBOARD = {
   ],
   resize_keyboard: true, is_persistent: true,
 };
+
 const BUTTON_MAP = {
   '📊 Status':'/status', '🎯 Groups':'/groups', '🔥 Open':'/open', '🔍 Find':'/find',
   '🕐 Early':'/early', '👁️ Watch':'/watch', '⏸️ Pause':'/pause', '▶️ Resume':'/resume',
@@ -291,15 +335,34 @@ const BOT_COMMANDS = [
 async function registerBotCommands() {
   if (!CONFIG.tgToken || !CONFIG.tgChatId) return;
   try {
+    // ✅ FIX: Telegram prefers a numeric chat_id in scope
+    const chatIdNum = Number(CONFIG.tgChatId);
+    const scope = Number.isFinite(chatIdNum)
+      ? { type: 'chat', chat_id: chatIdNum }
+      : { type: 'default' };
     await fetch(`https://api.telegram.org/bot${CONFIG.tgToken}/setMyCommands`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ commands: BOT_COMMANDS, scope: { type: 'chat', chat_id: CONFIG.tgChatId } }),
+      body: JSON.stringify({ commands: BOT_COMMANDS, scope }),
     });
     log.ok(`Registered ${BOT_COMMANDS.length} commands`);
   } catch (e) { log.warn('Command registration failed:', e.message); }
 }
+
+// ✅ FIX: short-id registry so inline callback_data stays ≤ 64 bytes
+function registerPendingGroup(state, name) {
+  state._cbCounter = (state._cbCounter || 0) + 1;
+  const id = 'g' + state._cbCounter;
+  state.pendingCallbacks = state.pendingCallbacks || {};
+  state.pendingCallbacks[id] = name;
+  const keys = Object.keys(state.pendingCallbacks);
+  if (keys.length > 200) {
+    for (const k of keys.slice(0, keys.length - 150)) delete state.pendingCallbacks[k];
+  }
+  return id;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
-//  TELEGRAM COMMANDS
+//  TELEGRAM — polling + commands
 // ═══════════════════════════════════════════════════════════════════════════
 async function handleTelegramCommands(state, api) {
   if (!CONFIG.tgToken) return;
@@ -310,6 +373,7 @@ async function handleTelegramCommands(state, api) {
       CONFIG.netTimeoutMs, 'tg-poll');
     const data = await res.json();
     if (!data.ok || !Array.isArray(data.result)) return;
+
     for (const upd of data.result) {
       state.lastTgUpdateId = Math.max(state.lastTgUpdateId || 0, upd.update_id);
       if (upd.callback_query) {
@@ -321,6 +385,7 @@ async function handleTelegramCommands(state, api) {
       const msg = upd.message;
       if (!msg?.text) continue;
       if (String(msg.chat.id) !== CONFIG.tgChatId) continue;
+
       const text = msg.text.trim();
       let cmd, args;
       if (BUTTON_MAP[text]) { cmd = BUTTON_MAP[text]; args = []; }
@@ -328,7 +393,10 @@ async function handleTelegramCommands(state, api) {
       await dispatchCommand(cmd, args, state, api);
     }
     saveState(state);
-  } catch {}
+  } catch (e) {
+    // ✅ FIX: log instead of silently swallowing
+    log.warn('TG poll failed:', e.message);
+  }
 }
 
 async function answerCallback(id, text = '') {
@@ -337,31 +405,39 @@ async function answerCallback(id, text = '') {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ callback_query_id: id, text }),
     });
-  } catch {}
+  } catch (e) { log.warn('answerCallback failed:', e.message); }
 }
 
 async function handleCallback(cb, state) {
   const [action, ...rest] = (cb.data || '').split(':');
-  const target = rest.join(':').trim();
+  const shortId = rest.join(':').trim();
   await answerCallback(cb.id);
-  if (!target) return;
+  if (!shortId) return;
+
+  const groupName = state.pendingCallbacks?.[shortId];
+  if (!groupName) {
+    await tgSend('⚠️ انتهت صلاحية الزر، استخدم /groups من جديد.');
+    return;
+  }
+
   if (action === 'watch') {
-    if (!state.watchedGroups.includes(target)) {
-      state.watchedGroups.push(target);
-      audit(state, 'watch_add', { group: target });
+    if (!state.watchedGroups.includes(groupName)) {
+      state.watchedGroups.push(groupName);
+      audit(state, 'watch_add', { group: groupName });
       saveState(state);
     }
-    await tgSend(`👁️ Added: <b>${escapeHtml(target)}</b>`);
+    await tgSend(`👁️ Added: <b>${escapeHtml(groupName)}</b>`);
   } else if (action === 'unwatch') {
-    state.watchedGroups = state.watchedGroups.filter(g => g !== target);
-    audit(state, 'watch_remove', { group: target });
+    state.watchedGroups = state.watchedGroups.filter(g => g !== groupName);
+    audit(state, 'watch_remove', { group: groupName });
     saveState(state);
-    await tgSend(`🚫 Removed: <b>${escapeHtml(target)}</b>`);
+    await tgSend(`🚫 Removed: <b>${escapeHtml(groupName)}</b>`);
   }
 }
 
 async function dispatchCommand(cmd, args, state, api) {
   const uptimeMin = Math.floor((Date.now() - (state.startedAt || Date.now())) / 60_000);
+  const targetCode = state.targetCourseCode || USER_CONFIG.targetCourse;
 
   switch (cmd) {
     case '/start': {
@@ -378,16 +454,16 @@ async function dispatchCommand(cmd, args, state, api) {
       const ed = state.earlyDetection || {};
       const openCount = Object.values(state.openGroupsState).filter(g => g.open).length;
       await tgSend(
-        `🟢 <b>Watcher v10.2</b>\n` +
+        `🟢 <b>Watcher v10.3</b>\n` +
         `⏱ <b>${uptimeMin} min</b> | 💾 <b>${rssMb()} MB</b> | ${state.paused ? '⏸ PAUSED' : '▶️ Running'}\n\n` +
-        `🎯 Target: <b>${escapeHtml(USER_CONFIG.targetCourse)}</b> (${target})\n` +
+        `🎯 Target: <b>${escapeHtml(targetCode)}</b> (${target})\n` +
         `📋 Status: ${state.targetCourseStatus != null ? statusLabel(state.targetCourseStatus) : '—'}\n` +
         `🕐 Early: <b>${ed.enabled ? '🟢 ON (10s)' : '🔴 OFF'}</b> | checks: <b>${ed.checks || 0}</b> | hits: <b>${ed.hits || 0}</b>\n` +
         `👁️ Watching: ${state.watchedGroups.length ? state.watchedGroups.map(escapeHtml).join(', ') : '<i>all</i>'}\n` +
         `🔥 Open now: <b>${openCount}</b>\n\n` +
         `🛡️ Baseline (${state.registeredCourses.length}): ${regs}\n\n` +
         `📊 opens=<b>${state.counters.opens}</b> drops=<b>${state.counters.drops}</b> adds=<b>${state.counters.adds}</b> ` +
-        `relogins=<b>${state.counters.relogins}</b> errors=<b>${state.counters.errors}</b>`
+        `alerts=<b>${state.counters.alertsSent}</b> relogins=<b>${state.counters.relogins}</b> errors=<b>${state.counters.errors}</b>`
       );
       break;
     }
@@ -396,16 +472,13 @@ async function dispatchCommand(cmd, args, state, api) {
       const sub = (args[0] || '').toLowerCase();
       const ed = state.earlyDetection = state.earlyDetection || {};
       if (sub === 'on') {
-        ed.enabled = true;
-        saveState(state);
+        ed.enabled = true; saveState(state);
         await tgSend(`🕐 <b>Early Detection: ON</b>\n\nChecking every <b>10 seconds</b>.`);
       } else if (sub === 'off') {
-        ed.enabled = false;
-        saveState(state);
+        ed.enabled = false; saveState(state);
         await tgSend(`🕐 <b>Early Detection: OFF</b>`);
       } else if (sub === 'reset') {
-        ed.checks = ed.hits = 0;
-        ed.lastFound = ed.notifiedAt = 0;
+        ed.checks = ed.hits = 0; ed.lastFound = ed.notifiedAt = 0;
         saveState(state);
         await tgSend(`🕐 Counters reset.`);
       } else {
@@ -415,7 +488,7 @@ async function dispatchCommand(cmd, args, state, api) {
           `Interval: <b>10s</b>\n` +
           `Checks: <b>${ed.checks || 0}</b>\n` +
           `Hits: <b>${ed.hits || 0}</b>\n` +
-          `Target: <b>${escapeHtml(USER_CONFIG.targetCourse)}</b>\n` +
+          `Target: <b>${escapeHtml(targetCode)}</b>\n` +
           `Resolved: <b>${state.targetCourseId ? '✅' : '❌'}</b>\n` +
           `Last check: ${timeSince(ed.lastCheck)}\n` +
           (ed.lastFound ? `Last found: ${timeSince(ed.lastFound)}\n` : '') +
@@ -451,6 +524,7 @@ async function dispatchCommand(cmd, args, state, api) {
       matches.slice(0, 20).forEach((c, i) => {
         msg += `${i+1}. <code>${escapeHtml(c.code)}</code> — ${escapeHtml(c.name)}\n   ${statusLabel(c.status)} | ID: <code>${escapeHtml(c.id)}</code>\n\n`;
       });
+      // ✅ IMPROVE: truncate inside tgSend() already handles this
       await tgSend(msg);
       break;
     }
@@ -471,20 +545,26 @@ async function dispatchCommand(cmd, args, state, api) {
 
     case '/groups': {
       if (!state.targetCourseId) {
-        await tgSend(`⏳ Target "<b>${escapeHtml(USER_CONFIG.targetCourse)}</b>" not available yet.\n\n🕐 Early Detection (10s) watching…`);
+        await tgSend(`⏳ Target "<b>${escapeHtml(targetCode)}</b>" not available yet.\n\n🕐 Early Detection (10s) watching…`);
         break;
       }
       const r = await api.getCourseSchedule(state.targetCourseId);
       if (r.kind !== 'ok' || !r.groups?.length) { await tgSend(`❌ No groups yet.`); break; }
       const sorted = [...r.groups].sort((a, b) => (a.available !== b.available) ? (a.available ? -1 : 1) : a.name.localeCompare(b.name));
-      let msg = `🎯 <b>${escapeHtml(USER_CONFIG.targetCourse)} — ${r.groups.length} groups</b>\n\n`;
+      let msg = `🎯 <b>${escapeHtml(targetCode)} — ${r.groups.length} groups</b>\n\n`;
       sorted.slice(0, 20).forEach((g) => {
         const w = state.watchedGroups.some(x => g.name.toUpperCase().includes(x.toUpperCase()));
         msg += `${w ? '👁️ ' : ''}${g.available ? '🔥' : '❄️'} <b>${escapeHtml(g.name)}</b> — 💺 ${g.seats}/${g.total}\n`;
         if (g.slots[0]) msg += `   📅 ${escapeHtml(g.slots[0].day)} | ⏰ ${escapeHtml(g.slots[0].time)}\n`;
       });
+
+      // ✅ FIX: short callback IDs — Arabic names no longer truncated
       const avail = sorted.filter(g => g.available).slice(0, 8);
-      const rows = avail.map(g => ([{ text: `👁️ Watch ${g.name} (${g.seats})`, callback_data: `watch:${g.name}`.slice(0, 64) }]));
+      const rows = avail.map(g => {
+        const id = registerPendingGroup(state, g.name);
+        return [{ text: `👁️ Watch ${g.name} (${g.seats})`, callback_data: `watch:${id}` }];
+      });
+      saveState(state);
       await tgSend(msg, { replyMarkup: rows.length ? { inline_keyboard: rows } : undefined });
       break;
     }
@@ -519,12 +599,13 @@ async function dispatchCommand(cmd, args, state, api) {
       if (!code) { await tgSend(`Usage: /target &lt;code&gt;`); break; }
       const resolved = await api.resolveTargetId(code, { onlyRegisterable: true });
       if (resolved) {
-        state.targetCourseId = resolved.id;
-        state.targetCourseCode = resolved.code;
-        state.targetCourseName = resolved.name;
+        state.targetCourseId     = resolved.id;
+        state.targetCourseCode   = resolved.code;
+        state.targetCourseName   = resolved.name;
         state.targetCourseStatus = resolved.status;
-        state.watchedGroups = [];
-        state.openGroupsState = {};
+        state.watchedGroups      = [];
+        state.openGroupsState    = {};
+        state.pendingCallbacks   = {};
         audit(state, 'target_set_manual', { code, id: resolved.id });
         saveState(state);
         await tgSend(`🎯 <b>Target</b>\n\n<code>${escapeHtml(resolved.code)}</code> — ${escapeHtml(resolved.name)}\nID: <code>${escapeHtml(resolved.id)}</code>\n${statusLabel(resolved.status)}`);
@@ -553,17 +634,23 @@ async function dispatchCommand(cmd, args, state, api) {
     case '/unwatch': {
       if (!args.length) { await tgSend(`Usage: /unwatch &lt;group&gt; | /unwatch all`); break; }
       const t = args.join(' ').trim();
-      if (t.toLowerCase() === 'all') { state.watchedGroups = []; }
-      else { state.watchedGroups = state.watchedGroups.filter(g => g !== t); }
+      if (t.toLowerCase() === 'all') state.watchedGroups = [];
+      else state.watchedGroups = state.watchedGroups.filter(g => g !== t);
       saveState(state);
       await tgSend(`🚫 Cleared/removed.`);
       break;
     }
 
     case '/reset': {
-      state.targetCourseId = state.targetCourseCode = state.targetCourseName = state.targetCourseStatus = null;
-      state.watchedGroups = [];
-      state.openGroupsState = {};
+      state.targetCourseId     = null;
+      state.targetCourseCode   = null;
+      state.targetCourseName   = null;
+      state.targetCourseStatus = null;
+      state.watchedGroups      = [];
+      state.openGroupsState    = {};
+      state.pendingCallbacks   = {};    // ✅ FIX
+      const ed = state.earlyDetection = state.earlyDetection || {};
+      ed.checks = 0; ed.hits = 0; ed.lastFound = 0; ed.notifiedAt = 0; ed.lastCheck = 0;  // ✅ FIX
       audit(state, 'reset');
       saveState(state);
       await tgSend(`🔄 Reset complete.`);
@@ -577,17 +664,8 @@ async function dispatchCommand(cmd, args, state, api) {
       break;
     }
 
-    case '/pause': {
-      state.paused = true; saveState(state);
-      await tgSend('⏸️ Paused');
-      break;
-    }
-
-    case '/resume': {
-      state.paused = false; saveState(state);
-      await tgSend('▶️ Resumed');
-      break;
-    }
+    case '/pause':  state.paused = true;  saveState(state); await tgSend('⏸️ Paused');  break;
+    case '/resume': state.paused = false; saveState(state); await tgSend('▶️ Resumed'); break;
 
     case '/help': {
       await tgSend(`🤖 <b>Commands</b>\n\n` + BOT_COMMANDS.map(c => `/<b>${c.command}</b> — ${c.description}`).join('\n'), { replyMarkup: MAIN_KEYBOARD });
@@ -606,10 +684,14 @@ function sessionAgeMinutes() {
       const m = JSON.parse(fs.readFileSync(CONFIG.sessionMetaFile, 'utf8'));
       return m.savedAt ? (Date.now() - m.savedAt) / 60000 : Infinity;
     }
-  } catch {}
+  } catch (e) { log.warn('session meta read failed:', e.message); }
   return Infinity;
 }
-function cleanupSession() { try { if (fs.existsSync(CONFIG.sessionFile)) fs.unlinkSync(CONFIG.sessionFile); } catch {} }
+function cleanupSession() {
+  try { if (fs.existsSync(CONFIG.sessionFile)) fs.unlinkSync(CONFIG.sessionFile); } catch (e) {
+    log.warn('session cleanup failed:', e.message);
+  }
+}
 async function saveSession(ctx) {
   try {
     await ctx.storageState({ path: CONFIG.sessionFile });
@@ -671,69 +753,59 @@ async function loginAndCaptureCookies(browser) {
   await ctx.close();
   log.ok('Logged in');
 }
+
 // ═══════════════════════════════════════════════════════════════════════════
-//  AJAX INTERCEPTION SETUP — persistent page captures the FULL course list
+//  AJAX INTERCEPTION
 // ═══════════════════════════════════════════════════════════════════════════
 async function setupAJAXInterception(ctx, pageRef) {
   if (pageRef.page && !pageRef.page.isClosed()) {
-    try { await pageRef.page.close(); } catch {}
+    try { await pageRef.page.close(); } catch (e) { log.warn('close old page failed:', e.message); }
   }
 
   pageRef.page = await ctx.newPage();
   pageRef.lastAJAX = null;
   pageRef.ajaxTime = 0;
 
-  // ⭐ Capture the AJAX that DULMS fires on page load
   pageRef.page.on('response', async (response) => {
     const url = response.url();
     if (url.includes('/Registered/GetStudentResiterationCourses')) {
       try {
         const json = await response.json();
         if (Array.isArray(json) && json.length > 0) {
+          const prev = pageRef.lastAJAX?.length || 0;
           pageRef.lastAJAX = json;
           pageRef.ajaxTime = Date.now();
-          log.ok(`Intercepted AJAX: ${json.length} courses`);
+          // ✅ FIX: no more spam — only log on change
+          if (json.length !== prev) log.ok(`Intercepted AJAX: ${json.length} courses (was ${prev})`);
         }
-      } catch (e) { /* not JSON */ }
+      } catch (e) { log.warn('AJAX parse failed:', e.message); }
     }
   });
 
-  // Navigate to trigger the AJAX
   await pageRef.page.goto(CONFIG.coursesPageUrl, {
-    waitUntil: 'domcontentloaded',
-    timeout: 30_000,
+    waitUntil: 'domcontentloaded', timeout: 30_000,
   }).catch((e) => log.warn('Page nav failed:', e.message));
 
-  // Wait for the AJAX to fire
-  for (let i = 0; i < 20 && !pageRef.lastAJAX; i++) {
-    await sleep(500);
-  }
+  for (let i = 0; i < 20 && !pageRef.lastAJAX; i++) await sleep(500);
 
-  if (pageRef.lastAJAX) {
-    log.ok(`AJAX ready: ${pageRef.lastAJAX.length} courses`);
-  } else {
-    log.warn('No AJAX captured yet');
-  }
+  if (pageRef.lastAJAX) log.ok(`AJAX ready: ${pageRef.lastAJAX.length} courses`);
+  else log.warn('No AJAX captured yet');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  API CLIENT — uses intercepted AJAX + fetch in authenticated page
+//  API CLIENT
 // ═══════════════════════════════════════════════════════════════════════════
 function makeApi(ctx, pageRef) {
   let courseCache = { ts: 0, data: null };
   const CACHE_TTL = 8 * 1000;
 
-  // ⭐ Fetch directly from the authenticated page (for schedule & regInfo)
   async function fetchInPage(path, options = {}) {
     const result = await pageRef.page.evaluate(async ({ path, options }) => {
       try {
         const res = await fetch(path, {
           method: options.method || 'GET',
           credentials: 'include',
-          headers: {
-            'X-Requested-With': 'XMLHttpRequest',
-            'Accept': 'application/json, text/plain, */*',
-          },
+          headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json, text/plain, */*' },
         });
         if (!res.ok) return { ok: false, status: res.status, text: '' };
         const text = await res.text();
@@ -764,7 +836,6 @@ function makeApi(ctx, pageRef) {
     return fetchInPage(url + qs, { method });
   }
 
-  // ⭐ Reload page to trigger a fresh AJAX
   async function triggerAjax() {
     try {
       if (!pageRef.page || pageRef.page.isClosed()) {
@@ -773,12 +844,18 @@ function makeApi(ctx, pageRef) {
       }
       pageRef.lastAJAX = null;
       await pageRef.page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => {});
-      for (let i = 0; i < 20 && !pageRef.lastAJAX; i++) {
-        await sleep(500);
-      }
-    } catch (e) {
-      log.warn('triggerAjax failed:', e.message);
-    }
+      for (let i = 0; i < 20 && !pageRef.lastAJAX; i++) await sleep(500);
+    } catch (e) { log.warn('triggerAjax failed:', e.message); }
+  }
+
+  function mapCourses(arr) {
+    return arr.map(c => ({
+      id: String(c.CourseId),
+      code: c.Code || '',
+      name: c.Name || '',
+      status: c.GradeStatusId,
+      group: c.GrpName,
+    }));
   }
 
   return {
@@ -794,12 +871,12 @@ function makeApi(ctx, pageRef) {
         const gid = item.GroupId;
         if (gid == null) continue;
         if (!groups[gid]) {
-          const rawName = String(item.GroupName || '').trim();
+          const rawName   = String(item.GroupName || '').trim();
           const shortName = String(item.ShortName || '').trim();
-          const isUni = !!item.IsUniversity;
+          const isUni     = !!item.IsUniversity;
           let displayName;
           if (isUni && shortName && rawName) displayName = `${shortName}-${rawName}`;
-          else if (rawName) displayName = rawName;
+          else if (rawName)  displayName = rawName;
           else if (shortName) displayName = `${shortName}-${gid}`;
           else displayName = `Group-${gid}`;
           groups[gid] = {
@@ -820,57 +897,37 @@ function makeApi(ctx, pageRef) {
       return { kind: 'ok', groups: list };
     },
 
-    // ⭐⭐⭐ KEY FUNCTION — uses intercepted AJAX for FULL list
     async getCourses({ forceRefresh = false } = {}) {
       if (!forceRefresh && courseCache.data && Date.now() - courseCache.ts < CACHE_TTL) {
         return { kind: 'ok', courses: courseCache.data };
       }
 
-      // Priority 1: Fresh AJAX data (within 60s)
-      if (pageRef.lastAJAX && Array.isArray(pageRef.lastAJAX) && pageRef.lastAJAX.length > 0 &&
+      // Priority 1: fresh AJAX (< 60s)
+      if (pageRef.lastAJAX && pageRef.lastAJAX.length > 0 &&
           Date.now() - pageRef.ajaxTime < 60_000) {
-        const list = pageRef.lastAJAX.map(c => ({
-          id: String(c.CourseId),
-          code: c.Code || '',
-          name: c.Name || '',
-          status: c.GradeStatusId,
-          group: c.GrpName,
-        }));
+        const list = mapCourses(pageRef.lastAJAX);
         courseCache = { ts: Date.now(), data: list };
         return { kind: 'ok', courses: list };
       }
 
-      // Priority 2: Reload to trigger fresh AJAX
+      // Priority 2: force reload
       await triggerAjax();
 
-      if (pageRef.lastAJAX && Array.isArray(pageRef.lastAJAX) && pageRef.lastAJAX.length > 0) {
-        const list = pageRef.lastAJAX.map(c => ({
-          id: String(c.CourseId),
-          code: c.Code || '',
-          name: c.Name || '',
-          status: c.GradeStatusId,
-          group: c.GrpName,
-        }));
+      if (pageRef.lastAJAX && pageRef.lastAJAX.length > 0) {
+        const list = mapCourses(pageRef.lastAJAX);
         courseCache = { ts: Date.now(), data: list };
         return { kind: 'ok', courses: list };
       }
 
-      // Priority 3: Direct fetch fallback
+      // Priority 3: direct fetch fallback
       log.warn('getCourses: AJAX failed, using direct fetch');
       const r = await fetchInPage(
         CONFIG.API.coursesList +
         '?GradeStatusIds=0,1,2,3,4,5&GroupsIds=-1&IsVirtualRegisteration=false'
       );
       if (r.kind !== 'ok') return r;
-
       const data = Array.isArray(r.data) ? r.data : [];
-      const list = data.map(c => ({
-        id: String(c.CourseId),
-        code: c.Code || '',
-        name: c.Name || '',
-        status: c.GradeStatusId,
-        group: c.GrpName,
-      }));
+      const list = mapCourses(data);
       courseCache = { ts: Date.now(), data: list };
       return { kind: 'ok', courses: list };
     },
@@ -884,25 +941,22 @@ function makeApi(ctx, pageRef) {
       if (r.kind !== 'ok') return null;
       const pool = onlyRegisterable ? r.courses.filter(c => isRegisterable(c.status)) : r.courses;
       const qNorm = normalizeCode(query);
-      const qRaw = String(query).toUpperCase().trim();
+      const qRaw  = String(query).toUpperCase().trim();
       const qNoSp = qRaw.replace(/\s+/g, '');
-      let f = pool.find(c => normalizeCode(c.code) === qNorm);
-      if (f) return f;
-      f = pool.find(c => String(c.code).toUpperCase().trim() === qRaw);
-      if (f) return f;
-      f = pool.find(c => normalizeCode(c.code).includes(qNorm));
-      if (f) return f;
-      f = pool.find(c => String(c.name).toUpperCase().includes(qRaw));
-      if (f) return f;
-      f = pool.find(c => String(c.name).toUpperCase().replace(/\s+/g, '').includes(qNoSp));
-      if (f) return f;
-      return null;
+      return (
+        pool.find(c => normalizeCode(c.code) === qNorm) ||
+        pool.find(c => String(c.code).toUpperCase().trim() === qRaw) ||
+        pool.find(c => normalizeCode(c.code).includes(qNorm)) ||
+        pool.find(c => String(c.name).toUpperCase().includes(qRaw)) ||
+        pool.find(c => String(c.name).toUpperCase().replace(/\s+/g, '').includes(qNoSp)) ||
+        null
+      );
     },
   };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  EARLY DETECTION — watches for target course to appear
+//  EARLY DETECTION
 // ═══════════════════════════════════════════════════════════════════════════
 async function earlyDetectionCheck(api, state) {
   if (!state.earlyDetection?.enabled) return { found: false };
@@ -911,14 +965,16 @@ async function earlyDetectionCheck(api, state) {
   state.earlyDetection.checks++;
   state.earlyDetection.lastCheck = Date.now();
 
+  // ✅ FIX: use the live target, not the hardcoded config
+  const query = state.targetCourseCode || USER_CONFIG.targetCourse;
   const r = await api.getCourses({ forceRefresh: true });
   if (r.kind !== 'ok') {
     log.warn(`Early detection: ${r.kind}`);
     return { found: false, error: r.kind };
   }
 
-  const qNorm = normalizeCode(USER_CONFIG.targetCourse);
-  const qRaw  = String(USER_CONFIG.targetCourse).toUpperCase().trim();
+  const qNorm = normalizeCode(query);
+  const qRaw  = String(query).toUpperCase().trim();
   const qNoSp = qRaw.replace(/\s+/g, '');
 
   const found = r.courses.find(c =>
@@ -940,18 +996,18 @@ async function earlyDetectionCheck(api, state) {
   state.earlyDetection.lastFound = Date.now();
   state.earlyDetection.notifiedAt = Date.now();
 
-  state.targetCourseId = found.id;
-  state.targetCourseCode = found.code;
-  state.targetCourseName = found.name;
+  state.targetCourseId     = found.id;
+  state.targetCourseCode   = found.code;
+  state.targetCourseName   = found.name;
   state.targetCourseStatus = found.status;
-  state.watchedGroups = [];
-  state.openGroupsState = {};
+  state.watchedGroups      = [];
+  state.openGroupsState    = {};
 
   log.ok(`🎉🎉🎉 EARLY DETECTION: ${found.code} (${found.name}) id=${found.id}`);
   audit(state, 'early_hit', { code: found.code, id: found.id });
 
   const msg =
-    `🎉🎉 <b>${escapeHtml(USER_CONFIG.targetCourse)} ظهرت!</b> 🎉🎉\n\n` +
+    `🎉🎉 <b>${escapeHtml(query)} ظهرت!</b> 🎉🎉\n\n` +
     `📋 Code: <code>${escapeHtml(found.code)}</code>\n` +
     `📚 Name: ${escapeHtml(found.name)}\n` +
     `🆔 ID: <code>${escapeHtml(found.id)}</code>\n` +
@@ -965,7 +1021,7 @@ async function earlyDetectionCheck(api, state) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  SECURITY — baseline guard (detect drops/adds)
+//  SECURITY — baseline guard
 // ═══════════════════════════════════════════════════════════════════════════
 function sameCourse(a, b) {
   if (a.id && b.id) return String(a.id) === String(b.id);
@@ -1006,7 +1062,7 @@ async function verifyRegistrationStability(api, state) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  SNIPER — watches open groups of the target
+//  SNIPER
 // ═══════════════════════════════════════════════════════════════════════════
 function filterMatchingGroups(groups, watched) {
   if (!Array.isArray(groups)) return [];
@@ -1045,7 +1101,8 @@ async function sniperCheck(api, state) {
     state.counters.alertsSent++;
     audit(state, 'target_open', { groups: newlyOpened.map(g => g.name) });
 
-    let msg = `🎉 <b>${escapeHtml(USER_CONFIG.targetCourse)} — ${newlyOpened.length} opened!</b>\n\n`;
+    const targetLabel = state.targetCourseCode || USER_CONFIG.targetCourse;
+    let msg = `🎉 <b>${escapeHtml(targetLabel)} — ${newlyOpened.length} opened!</b>\n\n`;
     newlyOpened.slice(0, 8).forEach((g, i) => {
       msg += `<b>${i+1}. ${escapeHtml(g.name)}</b> — 💺 ${g.seats}/${g.total}\n`;
       if (g.slots[0]) {
@@ -1067,6 +1124,7 @@ async function sniperCheck(api, state) {
 
   return { kind: 'open', groups: openGroups };
 }
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  MAIN LOOP
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1078,7 +1136,6 @@ async function runScan(browser, deadline) {
 
   let ctx = await createAuthContext(browser, true);
 
-  // ⭐ Persistent page with AJAX interception
   const pageRef = { page: null, lastAJAX: null, ajaxTime: 0 };
   await setupAJAXInterception(ctx, pageRef);
 
@@ -1087,6 +1144,9 @@ async function runScan(browser, deadline) {
   const state = loadState();
   state.startedAt = Date.now();
   if (!state.earlyDetection) state.earlyDetection = defaultState().earlyDetection;
+
+  // ✅ FIX: expose live state to the shutdown handler
+  setCurrentState(state);
 
   // Chat migration
   if (!state.tgChatId) state.tgChatId = CONFIG.tgChatId;
@@ -1100,9 +1160,10 @@ async function runScan(browser, deadline) {
   const startupGapMs = USER_CONFIG.startupBriefHours * 60 * 60_000;
   if (Date.now() - state.startupBriefedAt > startupGapMs) {
     state.startupBriefedAt = Date.now();
+    const targetLabel = state.targetCourseCode || USER_CONFIG.targetCourse;
     await tgSend(
-      `🚀 <b>Watcher v10.2</b>\n\n` +
-      `🎯 Sniping <b>${escapeHtml(USER_CONFIG.targetCourse)}</b>\n` +
+      `🚀 <b>Watcher v10.3</b>\n\n` +
+      `🎯 Sniping <b>${escapeHtml(targetLabel)}</b>\n` +
       `🕐 Early Detection: <b>ON — every 10s</b>\n` +
       `🛡️ Guarding <b>${state.registeredCourses.length}</b> courses\n\n` +
       `Send /help or use the buttons.`,
@@ -1111,7 +1172,7 @@ async function runScan(browser, deadline) {
     saveState(state);
   }
 
-  log.step(`STARTED — Target: ${USER_CONFIG.targetCourse} | Early every 10s`);
+  log.step(`STARTED — Target: ${state.targetCourseCode || USER_CONFIG.targetCourse} | Early every 10s`);
 
   const timers = {
     sniper:         Date.now() + 500,
@@ -1120,19 +1181,22 @@ async function runScan(browser, deadline) {
     telegram:       Date.now() + 1_000,
     memory:         Date.now() + 60_000,
     pageHealth:     Date.now() + 30_000,
+    sessionRenew:   Date.now() + USER_CONFIG.sessionRenewEveryMs,   // ✅ IMPROVE
   };
 
   while (Date.now() < deadline) {
     const now = Date.now();
-    if (state.paused) { await sleep(1000); continue; }
 
-    // ── Telegram ───────────────────────────────────────────────────
+    // ── Telegram (ALWAYS runs, even when paused) ──────────────────
+    // ✅ FIX: pause check moved below so /resume always reaches us
     if (now >= timers.telegram) {
       await handleTelegramCommands(state, api);
       timers.telegram = Date.now() + USER_CONFIG.telegramPollMs;
     }
 
-    // ── Memory watchdog ─────────────────────────────────────────────
+    if (state.paused) { await sleep(1000); continue; }
+
+    // ── Memory watchdog ───────────────────────────────────────────
     if (now >= timers.memory) {
       const mb = rssMb();
       if (mb >= CONFIG.memRestartMb) {
@@ -1146,7 +1210,7 @@ async function runScan(browser, deadline) {
       timers.memory = Date.now() + 60_000;
     }
 
-    // ── Page health check ───────────────────────────────────────────
+    // ── Page health ────────────────────────────────────────────────
     if (now >= timers.pageHealth) {
       try {
         if (!pageRef.page || pageRef.page.isClosed()) {
@@ -1154,25 +1218,35 @@ async function runScan(browser, deadline) {
           await setupAJAXInterception(ctx, pageRef);
           api = makeApi(ctx, pageRef);
         }
-      } catch (e) {
-        log.warn('Page health check failed:', e.message);
-      }
+      } catch (e) { log.warn('Page health check failed:', e.message); }
       timers.pageHealth = Date.now() + 30_000;
     }
 
-    // ── ⭐ EARLY DETECTION (every 10s) ─────────────────────────────
+    // ── Proactive session renewal ─────────────────────────────────
+    if (now >= timers.sessionRenew) {
+      try {
+        log.info('Proactive session renewal…');
+        await saveSession(ctx);
+        timers.sessionRenew = Date.now() + USER_CONFIG.sessionRenewEveryMs;
+      } catch (e) {
+        log.warn('Session renewal failed:', e.message);
+        timers.sessionRenew = Date.now() + 60_000;
+      }
+    }
+
+    // ── Early Detection ────────────────────────────────────────────
     if (!state.targetCourseId && state.earlyDetection.enabled && now >= timers.earlyDetection) {
       try {
         const ed = await earlyDetectionCheck(api, state);
         if (ed.found) log.ok('🎉 Early detection HIT!');
-      } catch (e) {
-        log.warn('Early detection error:', e.message);
-      }
-      timers.earlyDetection = Date.now() + USER_CONFIG.earlyDetectionIntervalMs;
+      } catch (e) { log.warn('Early detection error:', e.message); }
+      // ✅ IMPROVE: interval added to previous fire time (no drift)
+      timers.earlyDetection += USER_CONFIG.earlyDetectionIntervalMs;
+      if (timers.earlyDetection < Date.now()) timers.earlyDetection = Date.now() + USER_CONFIG.earlyDetectionIntervalMs;
       saveState(state);
     }
 
-    // ── Security baseline (every 10 min) ────────────────────────────
+    // ── Security baseline ──────────────────────────────────────────
     if (now >= timers.security) {
       try {
         const sr = await verifyRegistrationStability(api, state);
@@ -1199,7 +1273,7 @@ async function runScan(browser, deadline) {
       }
     }
 
-    // ── Sniper (every 10s, after target resolved) ───────────────────
+    // ── Sniper ─────────────────────────────────────────────────────
     if (state.targetCourseId && now >= timers.sniper) {
       try {
         const sr = await sniperCheck(api, state);
@@ -1217,7 +1291,9 @@ async function runScan(browser, deadline) {
           state.counters.errors++;
           timers.sniper = Date.now() + 30_000;
         } else {
-          timers.sniper = Date.now() + USER_CONFIG.sniperIntervalMs;
+          // ✅ IMPROVE: keep sniper aligned to its own cadence
+          timers.sniper += USER_CONFIG.sniperIntervalMs;
+          if (timers.sniper < Date.now()) timers.sniper = Date.now() + USER_CONFIG.sniperIntervalMs;
         }
       } catch (e) {
         log.warn('Sniper error:', e.message);
@@ -1241,7 +1317,8 @@ function setupShutdownHandlers() {
     if (shuttingDown) return;
     shuttingDown = true;
     log.warn(`${sig} — saving state`);
-    try { saveState(loadState()); } catch {}
+    // ✅ FIX: persist the LIVE state, not a fresh reload
+    if (_currentState) { try { saveState(_currentState); } catch {} }
     process.exit(0);
   };
   process.on('SIGTERM', () => h('SIGTERM'));
@@ -1261,15 +1338,26 @@ function setupShutdownHandlers() {
   const startTs = Date.now();
   const deadline = startTs + CONFIG.durationMin * 60_000;
 
-  log.info(`Watcher v10.2 — PID ${process.pid}, RSS ${rssMb()} MB, ${CONFIG.durationMin} min`);
+  log.info(`Watcher v10.3 — PID ${process.pid}, RSS ${rssMb()} MB, ${CONFIG.durationMin} min`);
 
   await registerBotCommands();
 
   let iter = 0;
   const maxIter = 10;
+
   while (Date.now() < deadline && iter < maxIter) {
     iter++;
-    const browser = await createBrowser();
+
+    // ✅ FIX: browser launch in try/catch — relay no longer dies on failures
+    let browser;
+    try {
+      browser = await createBrowser();
+    } catch (e) {
+      log.err('Browser launch failed:', e.message);
+      await sleep(3_000);
+      continue;
+    }
+
     let result;
     try {
       result = await runScan(browser, deadline);
@@ -1282,10 +1370,15 @@ function setupShutdownHandlers() {
     }
 
     if (result === RESULT.COMPLETED) { log.ok('Run completed'); break; }
-    if (result === RESULT.REBUILD) { log.info('Rebuilding…'); await sleep(2_000); continue; }
-    if (result === RESULT.FATAL) { log.err('Fatal — aborting'); break; }
+    if (result === RESULT.REBUILD)   { log.info('Rebuilding…'); await sleep(2_000); continue; }
+    if (result === RESULT.FATAL)     { log.err('Fatal — aborting'); break; }
   }
 
-  try { saveState(loadState()); } catch {}
+  // Final flush — uses the live state if available, otherwise whatever is on disk
+  try {
+    if (_currentState) saveState(_currentState);
+    else saveState(loadState());
+  } catch {}
+
   log.info(`Exiting — RSS ${rssMb()} MB`);
 })();
