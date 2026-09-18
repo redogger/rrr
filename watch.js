@@ -1,13 +1,17 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- *  DULMS Watcher v9.1 — English Sniper Edition
+ *  DULMS Watcher v9.2 — Diagnostic Edition
  *  ---------------------------------------------------------------------------
- *  New in v9.1:
- *   • normalizeCode() — ignores spaces/dashes/case in course comparisons
- *   • Interactive Reply Keyboard for quick actions
- *   • Inline "Watch this group" buttons when /groups is called
- *   • Lecture-only aware (skips SubGroup logic for GEN 101)
- *   • New commands: /open, /reset, /next
- *   • Fixes: all course-code comparisons, baseline, resolveTargetId
+ *  New in v9.2:
+ *   • Multi-source resolveTargetId (3 sources × 6 layers)
+ *   • /find command — search ALL courses with status
+ *   • /diag command — full diagnostic dump
+ *   • Registerable-only filter (rejects already-registered courses)
+ *   • Auto-reset watch list on target change
+ *   • Course list caching (5 min TTL)
+ *   • Better session-dead detection
+ *   • statusLabel helper for readability
+ *   • Detailed failure logging
+ *   • GroupsIds fallback (tries '', -1, then missing)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 'use strict';
@@ -20,27 +24,24 @@ const path = require('path');
 //  USER CONFIG
 // ═══════════════════════════════════════════════════════════════════════════
 const USER_CONFIG = {
-  // 🎯 English sniper config
   targetCourse:         'GEN 101',
   targetCourseId:       null,
-  targetIsLectureOnly:  true,       // GEN 101 = lectures only (no subgroups)
+  targetIsLectureOnly:  true,
 
-  // Expected registered courses
   expectedCourses:      ['MEC151', 'BAS111', 'CIV111', 'CIV121', 'CIV131'],
 
-  // Preferred groups (empty = any)
   preferredGroups:      [],
 
-  // Timing
   sniperIntervalMs:     10 * 1000,
   securityIntervalMs:   10 * 60 * 1000,
   telegramPollMs:       5  * 1000,
   heartbeatMs:          500,
 
-  // Behavior
   startupBriefHours:    12,
   notifyWithSound:      true,
   maxTelegramPerMin:    20,
+
+  courseCacheTtlMs:     5 * 60 * 1000,   // 5 min cache for course lists
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -76,7 +77,7 @@ const CONFIG = {
   auditMaxBytes:    1 * 1024 * 1024,
 
   timezone:         'Africa/Cairo',
-  stateVersion:     91,
+  stateVersion:     92,
 };
 
 const RESULT = Object.freeze({
@@ -114,9 +115,26 @@ function escapeHtml(s) {
   ));
 }
 
-// ⭐ NEW: Normalize course codes for comparison (ignore spaces, dashes, case)
 const normalizeCode = (s) =>
   String(s || '').toUpperCase().replace(/\s+/g, '').replace(/-/g, '');
+
+function statusLabel(status) {
+  const map = {
+    0: '❌ Failed',
+    1: '✅ Passed',
+    2: '↩️ Withdrawn',
+    3: '⏳ Pending Verification',
+    4: '📝 Registered',
+    5: '🆕 Never Registered',
+  };
+  if (status == null) return '❓ Unknown';
+  return map[Number(status)] || `❓ Unknown (${status})`;
+}
+
+function statusIsRegisterable(status) {
+  const s = Number(status);
+  return s === 0 || s === 2 || s === 5; // failed, withdrawn, never
+}
 
 async function withTimeout(promise, ms, label = 'op') {
   let t;
@@ -171,6 +189,7 @@ function defaultState() {
     targetCourseId:       USER_CONFIG.targetCourseId,
     targetCourseCode:     null,
     targetCourseName:     null,
+    targetCourseStatus:   null,
     targetIsLectureOnly:  USER_CONFIG.targetIsLectureOnly,
     openGroupsState:      {},
     lastTgUpdateId:       0,
@@ -178,6 +197,7 @@ function defaultState() {
     watchedGroups:        [...USER_CONFIG.preferredGroups],
     startupBriefedAt:     0,
     paused:               false,
+    targetResolveFailures: 0,   // ← NEW: count consecutive failures
     audit:                [],
     counters: {
       opens: 0, closes: 0, drops: 0, adds: 0,
@@ -227,7 +247,7 @@ function audit(state, event, details = {}) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  TELEGRAM — send with optional reply_markup
+//  TELEGRAM
 // ═══════════════════════════════════════════════════════════════════════════
 const tgQueue = [];
 let tgSending = false;
@@ -279,11 +299,10 @@ async function tgSend(html, { silent = false, replyMarkup = null } = {}) {
   } finally { tgSending = false; }
 }
 
-// ⭐ NEW: Reply keyboard (persistent quick-action bar)
 const MAIN_KEYBOARD = {
   keyboard: [
     [{ text: '📊 Status' }, { text: '🎯 Groups' }],
-    [{ text: '🔥 Open' },   { text: 'ℹ️ Info' }],
+    [{ text: '🔥 Open' },   { text: '🔍 Find' }],
     [{ text: '👁️ Watch' },  { text: '📋 Audit' }],
     [{ text: '⏸️ Pause' },  { text: '▶️ Resume' }],
     [{ text: '🔄 Reset' },  { text: '❓ Help' }],
@@ -293,12 +312,11 @@ const MAIN_KEYBOARD = {
   input_field_placeholder: 'اختر أمرًا أو اكتب /help',
 };
 
-// Map button text → command
 const BUTTON_MAP = {
   '📊 Status':   '/status',
   '🎯 Groups':   '/groups',
   '🔥 Open':     '/open',
-  'ℹ️ Info':     '/info',
+  '🔍 Find':     '/find',
   '👁️ Watch':    '/watch',
   '📋 Audit':    '/audit',
   '⏸️ Pause':    '/pause',
@@ -315,18 +333,19 @@ async function sendMainKeyboard() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  TELEGRAM — commands
+//  COMMANDS
 // ═══════════════════════════════════════════════════════════════════════════
 const BOT_COMMANDS = [
   { command: 'start',    description: '🟢 Bot alive + main keyboard' },
   { command: 'status',   description: '📊 Full status report' },
-  { command: 'baseline', description: '🛡️ Registered courses + missing' },
-  { command: 'groups',   description: '🎯 Target course groups (with Watch buttons)' },
-  { command: 'open',     description: '🔥 Only currently open groups' },
-  { command: 'next',     description: '⏱️ Next check countdown' },
+  { command: 'baseline', description: '🛡️ Registered courses' },
+  { command: 'find',     description: '🔍 Search courses by code/name' },
+  { command: 'diag',     description: '🩺 Diagnostic dump of all courses' },
+  { command: 'groups',   description: '🎯 Target course groups' },
+  { command: 'open',     description: '🔥 Currently open groups' },
   { command: 'info',     description: 'ℹ️ Registration period info' },
-  { command: 'target',   description: '🎯 Set target course manually' },
-  { command: 'watch',    description: '👁️ Watch a group (or list watched)' },
+  { command: 'target',   description: '🎯 Set target (registerable only)' },
+  { command: 'watch',    description: '👁️ Watch a group' },
   { command: 'unwatch',  description: '🚫 Stop watching (or "all")' },
   { command: 'reset',    description: '🔄 Reset target + watch list' },
   { command: 'audit',    description: '📜 Last 10 events' },
@@ -364,7 +383,6 @@ async function handleTelegramCommands(state, api, timers) {
     for (const upd of data.result) {
       state.lastTgUpdateId = Math.max(state.lastTgUpdateId || 0, upd.update_id);
 
-      // ── Callback query (inline button press) ─────────────────────
       if (upd.callback_query) {
         const cb = upd.callback_query;
         const chatId = String(cb.message?.chat?.id || cb.from?.id);
@@ -373,7 +391,6 @@ async function handleTelegramCommands(state, api, timers) {
         continue;
       }
 
-      // ── Regular message ─────────────────────────────────────────
       const msg = upd.message;
       if (!msg || !msg.text) continue;
 
@@ -385,8 +402,6 @@ async function handleTelegramCommands(state, api, timers) {
       }
 
       const text = msg.text.trim();
-
-      // ⭐ NEW: button text → command
       let cmd, args;
       if (BUTTON_MAP[text]) {
         cmd = BUTTON_MAP[text];
@@ -408,11 +423,7 @@ async function answerCallback(cbId, text = '', showAlert = false) {
     await fetch(`https://api.telegram.org/bot${CONFIG.tgToken}/answerCallbackQuery`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        callback_query_id: cbId,
-        text,
-        show_alert: showAlert,
-      }),
+      body: JSON.stringify({ callback_query_id: cbId, text, show_alert: showAlert }),
     });
   } catch {}
 }
@@ -420,8 +431,6 @@ async function answerCallback(cbId, text = '', showAlert = false) {
 async function handleCallback(cb, state, api) {
   const data = cb.data || '';
   await answerCallback(cb.id);
-
-  // data format: "watch:<group_name>" or "unwatch:<group_name>"
   const [action, ...rest] = data.split(':');
   const target = rest.join(':').trim();
   if (!target) return;
@@ -437,7 +446,7 @@ async function handleCallback(cb, state, api) {
     state.watchedGroups = state.watchedGroups.filter(g => g !== target);
     audit(state, 'watch_remove', { group: target });
     saveState(state);
-    await tgSend(`🚫 Removed from watch list: <b>${escapeHtml(target)}</b>`);
+    await tgSend(`🚫 Removed: <b>${escapeHtml(target)}</b>`);
   }
 }
 
@@ -449,7 +458,6 @@ async function dispatchCommand(cmd, args, state, api, timers) {
     // ─────────────────────────────────────────────────────────────
     case '/start': {
       await sendMainKeyboard();
-      // Also send status
       await dispatchCommand('/status', [], state, api, timers);
       break;
     }
@@ -462,17 +470,21 @@ async function dispatchCommand(cmd, args, state, api, timers) {
       const target = state.targetCourseId
         ? `<code>${escapeHtml(state.targetCourseId)}</code>`
         : '⏳ resolving';
+      const targetStatus = state.targetCourseStatus != null
+        ? statusLabel(state.targetCourseStatus)
+        : '—';
       const watched = state.watchedGroups.length
         ? state.watchedGroups.map(escapeHtml).join(', ')
         : '<i>all groups</i>';
       const openCount = Object.values(state.openGroupsState).filter(g => g.open).length;
 
       await tgSend(
-        `🟢 <b>Watcher v9.1</b>\n` +
+        `🟢 <b>Watcher v9.2</b>\n` +
         `⏱ Uptime: <b>${uptimeMin} min</b> | 💾 RSS: <b>${rssMb()} MB</b>\n` +
         `${state.paused ? '⏸ <b>PAUSED</b>' : '▶️ Running'}\n\n` +
         `🎯 Target: <b>${escapeHtml(USER_CONFIG.targetCourse)}</b> (${target})\n` +
-        `📚 Type: <b>${state.targetIsLectureOnly ? 'lectures only' : 'full'}</b>\n` +
+        `📋 Status: ${targetStatus}\n` +
+        `📚 Mode: <b>${state.targetIsLectureOnly ? 'lectures only' : 'full'}</b>\n` +
         `👁️ Watching: ${watched}\n` +
         `🔥 Open now: <b>${openCount}</b>\n\n` +
         `🛡️ Baseline (${state.registeredCourses.length}): ${regs}\n\n` +
@@ -504,11 +516,83 @@ async function dispatchCommand(cmd, args, state, api, timers) {
     }
 
     // ─────────────────────────────────────────────────────────────
+    case '/find': {
+      const q = args.join(' ').trim();
+      if (!q) {
+        await tgSend(
+          `🔍 <b>Search courses</b>\n\n` +
+          `Usage: <code>/find &lt;code or name&gt;</code>\n` +
+          `Examples:\n` +
+          `• <code>/find GEN</code>\n` +
+          `• <code>/find CIV</code>\n` +
+          `• <code>/find English</code>`
+        );
+        break;
+      }
+      const r = await api.getCourses({ statuses: '0,1,2,3,4,5', forceRefresh: true });
+      if (r.kind !== 'ok' || !r.courses) {
+        await tgSend(`❌ API error: <code>${escapeHtml(r.kind)}</code>`);
+        break;
+      }
+      const qUp = q.toUpperCase();
+      const qNorm = qUp.replace(/\s+/g, '');
+      const matches = r.courses.filter(c =>
+        String(c.code).toUpperCase().includes(qUp) ||
+        String(c.name).toUpperCase().includes(qUp) ||
+        String(c.code).toUpperCase().replace(/\s+/g, '').includes(qNorm)
+      );
+
+      if (matches.length === 0) {
+        await tgSend(
+          `🔍 <b>No matches for "${escapeHtml(q)}"</b>\n\n` +
+          `📊 Total courses from API: <b>${r.courses.length}</b>\n\n` +
+          `<i>Try shorter query or /diag to see all.</i>`
+        );
+        break;
+      }
+      let msg = `🔍 <b>${matches.length} match(es) for "${escapeHtml(q)}":</b>\n\n`;
+      matches.slice(0, 20).forEach((c, i) => {
+        msg += `<b>${i + 1}.</b> <code>${escapeHtml(c.code)}</code>\n`;
+        msg += `   ${escapeHtml(c.name)}\n`;
+        msg += `   ${statusLabel(c.status)} | ID: <code>${escapeHtml(c.id)}</code>\n\n`;
+      });
+      if (matches.length > 20) msg += `<i>…and ${matches.length - 20} more.</i>`;
+      await tgSend(msg);
+      break;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    case '/diag': {
+      const r = await api.getCourses({ statuses: '0,1,2,3,4,5', forceRefresh: true });
+      if (r.kind !== 'ok' || !r.courses) {
+        await tgSend(`❌ API error: <code>${escapeHtml(r.kind)}</code>`);
+        break;
+      }
+      // Group by status
+      const byStatus = { 0: [], 1: [], 2: [], 3: [], 4: [], 5: [] };
+      for (const c of r.courses) {
+        const s = Number(c.status);
+        if (byStatus[s]) byStatus[s].push(c.code);
+      }
+      let msg = `🩺 <b>Diagnostic Dump</b>\n\n`;
+      msg += `📊 <b>Total: ${r.courses.length} courses</b>\n\n`;
+      for (const [s, codes] of Object.entries(byStatus)) {
+        if (codes.length === 0) continue;
+        msg += `${statusLabel(Number(s))} (${codes.length}):\n`;
+        msg += `<code>${codes.slice(0, 15).map(escapeHtml).join(', ')}</code>\n`;
+        if (codes.length > 15) msg += `<i>…+${codes.length - 15} more</i>\n`;
+        msg += `\n`;
+      }
+      await tgSend(msg);
+      break;
+    }
+
+    // ─────────────────────────────────────────────────────────────
     case '/groups': {
       if (!state.targetCourseId) {
         await tgSend(
-          `⚠️ Target course ID not resolved yet.\n` +
-          `Send <code>/target GEN101</code> to set it manually.`
+          `⚠️ Target not resolved.\n\n` +
+          `Try: <code>/target GEN101</code>`
         );
         break;
       }
@@ -517,8 +601,6 @@ async function dispatchCommand(cmd, args, state, api, timers) {
         await tgSend(`❌ No groups for <b>${escapeHtml(USER_CONFIG.targetCourse)}</b> right now.`);
         break;
       }
-
-      // Sort: open first
       const sorted = [...r.groups].sort((a, b) => {
         if (a.available !== b.available) return a.available ? -1 : 1;
         return a.name.localeCompare(b.name);
@@ -527,7 +609,7 @@ async function dispatchCommand(cmd, args, state, api, timers) {
       let msg = `🎯 <b>${escapeHtml(USER_CONFIG.targetCourse)} — ${r.groups.length} groups</b>\n`;
       msg += `<i>🔥=open · ❄️=full · 👁️=watched</i>\n\n`;
 
-      sorted.slice(0, 20).forEach((g, i) => {
+      sorted.slice(0, 20).forEach((g) => {
         const watched = state.watchedGroups.some(w =>
           g.name.toUpperCase().includes(w.toUpperCase())
         );
@@ -542,7 +624,6 @@ async function dispatchCommand(cmd, args, state, api, timers) {
       });
       if (sorted.length > 20) msg += `\n<i>…and ${sorted.length - 20} more.</i>`;
 
-      // ⭐ Inline buttons: Watch for each available group (max 8)
       const availableGroups = sorted.filter(g => g.available).slice(0, 8);
       const inlineRows = availableGroups.map(g => ([{
         text: `👁️ Watch ${g.name} (${g.seats} seats)`,
@@ -578,23 +659,6 @@ async function dispatchCommand(cmd, args, state, api, timers) {
     }
 
     // ─────────────────────────────────────────────────────────────
-    case '/next': {
-      if (!timers) {
-        await tgSend(`⏱️ Timer info unavailable.`);
-        break;
-      }
-      const now = Date.now();
-      const sniperSec = Math.max(0, Math.round((timers.sniper - now) / 1000));
-      const securitySec = Math.max(0, Math.round((timers.security - now) / 1000));
-      await tgSend(
-        `⏱️ <b>Next checks</b>\n\n` +
-        `🎯 Sniper: in <b>${sniperSec}s</b>\n` +
-        `🛡️ Security: in <b>${Math.round(securitySec / 60)} min</b>`
-      );
-      break;
-    }
-
-    // ─────────────────────────────────────────────────────────────
     case '/info': {
       const r = await api.getRegInfo();
       if (r.kind !== 'ok' || !Array.isArray(r.data) || r.data.length === 0) {
@@ -623,27 +687,57 @@ async function dispatchCommand(cmd, args, state, api, timers) {
       const code = args.join(' ').trim();
       if (!code) {
         await tgSend(
-          `Usage: <code>/target &lt;course_code&gt;</code>\n` +
+          `🎯 <b>Set Target</b>\n\n` +
+          `Usage: <code>/target &lt;course_code&gt;</code>\n\n` +
           `Current: <b>${escapeHtml(USER_CONFIG.targetCourse)}</b> ` +
-          `(id: ${state.targetCourseId ? `<code>${escapeHtml(state.targetCourseId)}</code>` : 'not resolved'})`
+          `(id: ${state.targetCourseId ? `<code>${escapeHtml(state.targetCourseId)}</code>` : 'not resolved'})\n\n` +
+          `<i>⚠️ Only registerable courses are accepted.</i>\n` +
+          `Use <code>/find</code> to search.`
         );
         break;
       }
-      const resolved = await api.resolveTargetId(code);
+
+      log.info(`/target: resolving "${code}" (registerable only)`);
+      const resolved = await api.resolveTargetId(code, { onlyRegisterable: true });
+
       if (resolved) {
         state.targetCourseId = resolved.id;
         state.targetCourseCode = resolved.code;
         state.targetCourseName = resolved.name;
+        state.targetCourseStatus = resolved.status;
+        state.watchedGroups = [];
+        state.openGroupsState = {};
+        state.targetResolveFailures = 0;
         audit(state, 'target_set_manual', { code, id: resolved.id });
         saveState(state);
         await tgSend(
           `🎯 <b>Target updated</b>\n\n` +
           `Code: <code>${escapeHtml(resolved.code)}</code>\n` +
           `Name: ${escapeHtml(resolved.name)}\n` +
-          `ID: <code>${escapeHtml(resolved.id)}</code>`
+          `ID: <code>${escapeHtml(resolved.id)}</code>\n` +
+          `Status: ${statusLabel(resolved.status)}\n\n` +
+          `<i>Watch list reset. Use /groups.</i>`
+        );
+        break;
+      }
+
+      // Not registerable — check why
+      log.info(`/target: "${code}" not registerable, checking full list`);
+      const all = await api.resolveTargetId(code, { onlyRegisterable: false });
+      if (all) {
+        await tgSend(
+          `⚠️ <b>"${escapeHtml(code)}" cannot be sniped</b>\n\n` +
+          `Code: <code>${escapeHtml(all.code)}</code>\n` +
+          `Name: ${escapeHtml(all.name)}\n` +
+          `Status: <b>${statusLabel(all.status)}</b>\n\n` +
+          `<i>You can only snipe: failed, withdrawn, or never-registered courses.</i>`
         );
       } else {
-        await tgSend(`❌ Could not resolve "<code>${escapeHtml(code)}</code>".`);
+        await tgSend(
+          `❌ <b>Could not find "${escapeHtml(code)}"</b>\n\n` +
+          `The course is not in your registration list.\n\n` +
+          `Try <code>/find ${escapeHtml(code.split(/\s+/)[0])}</code> to search.`
+        );
       }
       break;
     }
@@ -655,7 +749,7 @@ async function dispatchCommand(cmd, args, state, api, timers) {
           await tgSend(
             `👁️ <b>Watch list: empty</b>\n\n` +
             `You'll receive alerts for <b>ANY group</b> that opens.\n\n` +
-            `Use <code>/groups</code> to see groups and tap 👁️ Watch, or use <code>/watch &lt;name&gt;</code>.`
+            `Use <code>/groups</code> to see groups and tap 👁️ Watch.`
           );
         } else {
           const rows = state.watchedGroups.map(g => ([{
@@ -707,17 +801,17 @@ async function dispatchCommand(cmd, args, state, api, timers) {
       state.targetCourseId = null;
       state.targetCourseCode = null;
       state.targetCourseName = null;
+      state.targetCourseStatus = null;
       state.watchedGroups = [];
       state.openGroupsState = {};
-      state.targetWasOpen = false;
+      state.targetResolveFailures = 0;
       audit(state, 'reset');
       saveState(state);
       await tgSend(
         `🔄 <b>Reset complete</b>\n\n` +
-        `🎯 Target cleared (will re-resolve)\n` +
+        `🎯 Target cleared (will auto re-resolve)\n` +
         `👁️ Watch list cleared\n` +
-        `🔥 Open state cleared\n\n` +
-        `<i>Bot will resume normally on next cycle.</i>`
+        `🔥 Open state cleared`
       );
       break;
     }
@@ -754,7 +848,7 @@ async function dispatchCommand(cmd, args, state, api, timers) {
       await tgSend(
         `🤖 <b>الأوامر المتاحة</b>\n\n` +
         BOT_COMMANDS.map(c => `/<b>${c.command}</b> — ${c.description}`).join('\n') +
-        `\n\n<i>💡 نصيحة: استخدم الأزرار تحت الشات للوصول السريع</i>`,
+        `\n\n<i>💡 استخدم الأزرار تحت الشات</i>`,
         { replyMarkup: MAIN_KEYBOARD }
       );
       break;
@@ -878,6 +972,9 @@ function classifyApiResponse(res, body) {
 }
 
 function makeApi(request) {
+  // ⭐ Course cache to avoid hammering the API
+  let courseCache = { ts: 0, data: null };
+
   async function call(method, url, { params, data } = {}) {
     const fullUrl = params
       ? `${url}?${new URLSearchParams(params).toString()}`
@@ -893,6 +990,7 @@ function makeApi(request) {
   }
 
   return {
+    // ⭐ Get course schedule (groups for a specific course)
     async getCourseSchedule(courseId) {
       const r = await retry(
         () => call('GET', CONFIG.API.courseSchedule, { params: { CourseId: courseId } }),
@@ -957,50 +1055,125 @@ function makeApi(request) {
       return { kind: 'ok', groups: list, hasSubgroups };
     },
 
-    async getCourses({ statuses = '3,4', groups = '-1', virtual = false } = {}) {
+    // ⭐ Get courses list (with cache)
+    async getCourses({ statuses = '3,4', groups = '-1', virtual = false, forceRefresh = false } = {}) {
+      // Cache check
+      if (!forceRefresh && courseCache.data &&
+          Date.now() - courseCache.ts < USER_CONFIG.courseCacheTtlMs) {
+        return { kind: 'ok', courses: courseCache.data };
+      }
+
+      const params = {
+        GradeStatusIds: statuses,
+        IsVirtualRegisteration: virtual,
+      };
+      if (groups !== '' && groups != null) {
+        params.GroupsIds = groups;
+      }
+
       const r = await retry(
-        () => call('GET', CONFIG.API.coursesList, {
-          params: { GradeStatusIds: statuses, GroupsIds: groups, IsVirtualRegisteration: virtual },
-        }),
+        () => call('GET', CONFIG.API.coursesList, { params }),
         { label: 'getCourses' }
       );
       if (r.kind !== 'ok') return r;
-      const list = (r.data || []).map(c => ({
+
+      const data = Array.isArray(r.data) ? r.data : [];
+      const list = data.map(c => ({
         id: String(c.CourseId),
-        code: c.Code,
-        name: c.Name,
+        code: c.Code || '',
+        name: c.Name || '',
         status: c.GradeStatusId,
         group: c.GrpName,
       }));
+
+      // Cache
+      courseCache = { ts: Date.now(), data: list };
       return { kind: 'ok', courses: list };
     },
 
+    // ⭐ Get registration info
     async getRegInfo() {
       return retry(() => call('POST', CONFIG.API.regInfo), { label: 'getRegInfo' });
     },
 
-    // ⭐ Robust target resolution with normalization
-    async resolveTargetId(query) {
-      const r = await this.getCourses({ statuses: '0,1,2,3,4,5' });
-      if (r.kind !== 'ok' || !r.courses) return null;
+    // ⭐⭐ ROBUST target resolution — 3 sources × 6 layers
+    async resolveTargetId(query, { onlyRegisterable = true } = {}) {
+      log.info(`resolveTargetId: query="${query}" onlyRegisterable=${onlyRegisterable}`);
 
-      const targetNorm = normalizeCode(query);
-      const targetRaw = String(query).toUpperCase().trim();
+      // Try multiple source configurations
+      const sources = [
+        { statuses: onlyRegisterable ? '0,2,5' : '0,1,2,3,4,5', groups: '-1', label: 'std' },
+        { statuses: '0,1,2,3,4,5', groups: '-1', label: 'all-statuses' },
+        { statuses: '0,1,2,3,4,5', groups: '',  label: 'all-groups' },
+      ];
 
-      // Layer 1: exact normalized (GEN101 = GEN 101 = GEN-101)
-      let found = r.courses.find(c => normalizeCode(c.code) === targetNorm);
-      // Layer 2: exact raw
-      if (!found) found = r.courses.find(c => String(c.code).toUpperCase().trim() === targetRaw);
-      // Layer 3: normalized contains
-      if (!found) found = r.courses.find(c => normalizeCode(c.code).includes(targetNorm));
-      // Layer 4: name contains
-      if (!found) {
-        const q = String(query).toUpperCase().replace(/\s+/g, '');
-        found = r.courses.find(c => String(c.name || '').toUpperCase().replace(/\s+/g, '').includes(q));
+      let allCourses = [];
+      for (const src of sources) {
+        try {
+          const r = await this.getCourses({
+            statuses: src.statuses,
+            groups: src.groups,
+            forceRefresh: true,
+          });
+          if (r.kind === 'ok' && r.courses && r.courses.length > 0) {
+            allCourses = r.courses;
+            log.ok(`resolveTargetId[${src.label}]: got ${r.courses.length} courses`);
+            break;
+          } else if (r.kind !== 'ok') {
+            log.warn(`resolveTargetId[${src.label}]: ${r.kind}`);
+          }
+        } catch (e) {
+          log.warn(`resolveTargetId[${src.label}]: ${e.message}`);
+        }
       }
 
-      if (!found) return null;
-      return { id: found.id, code: found.code, name: found.name };
+      if (allCourses.length === 0) {
+        log.warn('resolveTargetId: no courses from any source');
+        return null;
+      }
+
+      // Debug: log first 10
+      const sample = allCourses.slice(0, 10).map(c => `${c.code}(${c.status})`).join(', ');
+      log.info(`Sample: ${sample}`);
+
+      const targetNorm = normalizeCode(query);
+      const targetRaw  = String(query).toUpperCase().trim();
+      const targetNoSp = String(query).toUpperCase().replace(/\s+/g, '');
+
+      // Layer 1: exact normalized
+      let found = allCourses.find(c => normalizeCode(c.code) === targetNorm);
+      if (found) { log.ok(`L1: ${found.code} (${found.status})`); return found; }
+
+      // Layer 2: exact raw
+      found = allCourses.find(c => String(c.code).toUpperCase().trim() === targetRaw);
+      if (found) { log.ok(`L2: ${found.code} (${found.status})`); return found; }
+
+      // Layer 3: normalized contains
+      found = allCourses.find(c => normalizeCode(c.code).includes(targetNorm));
+      if (found) { log.ok(`L3: ${found.code} (${found.status})`); return found; }
+
+      // Layer 4: name contains (raw)
+      found = allCourses.find(c => String(c.name).toUpperCase().includes(targetRaw));
+      if (found) { log.ok(`L4: ${found.code} (${found.status})`); return found; }
+
+      // Layer 5: name contains (no spaces)
+      found = allCourses.find(c =>
+        String(c.name).toUpperCase().replace(/\s+/g, '').includes(targetNoSp)
+      );
+      if (found) { log.ok(`L5: ${found.code} (${found.status})`); return found; }
+
+      // Layer 6: fuzzy — all tokens match
+      const tokens = targetRaw.split(/\s+/).filter(t => t.length >= 3);
+      if (tokens.length > 0) {
+        found = allCourses.find(c => {
+          const hay = `${c.code} ${c.name}`.toUpperCase();
+          return tokens.every(t => hay.includes(t));
+        });
+        if (found) { log.ok(`L6: ${found.code} (${found.status})`); return found; }
+      }
+
+      log.warn(`resolveTargetId: FAILED for "${query}" (${allCourses.length} courses)`);
+      return null;
     },
   };
 }
@@ -1095,11 +1268,6 @@ async function sniperCheck(api, state) {
   const r = await api.getCourseSchedule(state.targetCourseId);
   if (r.kind !== 'ok') return r;
 
-  // ⭐ Auto-detect: if no subgroups and targetIsLectureOnly=false, mark it
-  if (USER_CONFIG.targetIsLectureOnly && r.hasSubgroups) {
-    log.warn('Target is lecture-only but API returned subgroups — will use groups only');
-  }
-
   const openGroups = filterMatchingGroups(r.groups, state.watchedGroups);
   const currentlyOpen = new Set(openGroups.map(g => g.name));
 
@@ -1107,7 +1275,6 @@ async function sniperCheck(api, state) {
     state.openGroupsState = {};
   }
 
-  // Detect newly opened
   const newlyOpened = [];
   for (const g of openGroups) {
     if (!g || typeof g.name !== 'string') continue;
@@ -1115,13 +1282,11 @@ async function sniperCheck(api, state) {
     if (!prev || !prev.open) newlyOpened.push(g);
   }
 
-  // Detect closed
   const closed = [];
   for (const [name, prev] of Object.entries(state.openGroupsState)) {
     if (prev.open && !currentlyOpen.has(name)) closed.push(name);
   }
 
-  // Update state
   for (const g of openGroups) {
     state.openGroupsState[g.name] = {
       open: true, lastSeen: Date.now(), seats: g.seats, total: g.total,
@@ -1135,7 +1300,6 @@ async function sniperCheck(api, state) {
     }
   }
 
-  // Notify
   if (newlyOpened.length > 0) {
     state.counters.opens += newlyOpened.length;
     state.counters.alertsSent++;
@@ -1155,7 +1319,6 @@ async function sniperCheck(api, state) {
     });
     msg += `🔗 <b>Open DULMS NOW!</b>`;
 
-    // Inline buttons: Quick register
     const btns = newlyOpened.slice(0, 3).map(g => ([{
       text: `📝 Register ${g.name}`,
       url: 'https://dulms.deltauniv.edu.eg/Registered/CoursesRegisteration',
@@ -1218,7 +1381,6 @@ async function runScan(browser, deadline) {
   await detectChatMigration(state);
   saveState(state);
 
-  // Startup brief (throttled)
   const startupGapMs = USER_CONFIG.startupBriefHours * 60 * 60_000;
   if (Date.now() - state.startupBriefedAt > startupGapMs) {
     state.startupBriefedAt = Date.now();
@@ -1229,11 +1391,11 @@ async function runScan(browser, deadline) {
       ? `\n⚠️ Waiting for: ${missing.map(escapeHtml).join(', ')}`
       : `\n✅ All registered courses present`;
     await tgSend(
-      `🚀 <b>Watcher v9.1 online</b>\n\n` +
+      `🚀 <b>Watcher v9.2 online</b>\n\n` +
       `🎯 Sniping <b>${escapeHtml(USER_CONFIG.targetCourse)}</b> every 10s\n` +
       `🎓 Mode: <b>lectures only</b>\n` +
       `🛡️ Guarding <b>${state.registeredCourses.length}</b> courses${missingTxt}\n\n` +
-      `Send /help or use the buttons below.`,
+      `Send /help or use the buttons.`,
       { replyMarkup: MAIN_KEYBOARD }
     );
     saveState(state);
@@ -1282,14 +1444,40 @@ async function runScan(browser, deadline) {
       const sr = await verifyRegistrationStability(api, state);
 
       if (sr.kind === 'ok') {
+        // ⭐ Auto-resolve target if needed
         if (!state.targetCourseId) {
+          log.info(`Attempting target auto-resolution for "${USER_CONFIG.targetCourse}"...`);
           const resolved = await api.resolveTargetId(USER_CONFIG.targetCourse);
           if (resolved) {
             state.targetCourseId = resolved.id;
             state.targetCourseCode = resolved.code;
             state.targetCourseName = resolved.name;
+            state.targetCourseStatus = resolved.status;
+            state.targetResolveFailures = 0;
             log.ok(`Target resolved: ${resolved.code} → id ${resolved.id}`);
             audit(state, 'target_resolved', resolved);
+            await tgSend(
+              `🎯 <b>Target auto-resolved</b>\n\n` +
+              `Code: <code>${escapeHtml(resolved.code)}</code>\n` +
+              `Name: ${escapeHtml(resolved.name)}\n` +
+              `Status: ${statusLabel(resolved.status)}`
+            );
+          } else {
+            state.targetResolveFailures = (state.targetResolveFailures || 0) + 1;
+            log.warn(`Target resolution failed (${state.targetResolveFailures} times)`);
+            audit(state, 'target_resolve_failed', { attempts: state.targetResolveFailures });
+
+            // ⭐ After 3 failures, notify user with hint
+            if (state.targetResolveFailures === 3) {
+              await tgSend(
+                `⚠️ <b>Could not auto-resolve "${escapeHtml(USER_CONFIG.targetCourse)}"</b>\n\n` +
+                `I tried 3 times without luck.\n\n` +
+                `Try:\n` +
+                `• <code>/diag</code> — see all your courses\n` +
+                `• <code>/find GEN</code> — search for GEN courses\n` +
+                `• <code>/target &lt;exact code&gt;</code> — set manually`
+              );
+            }
           }
         }
         timers.security = Date.now() + USER_CONFIG.securityIntervalMs;
@@ -1384,7 +1572,7 @@ function setupShutdownHandlers() {
   const startTs = Date.now();
   const deadline = startTs + CONFIG.durationMin * 60_000;
 
-  log.info(`Watcher v9.1 starting — PID ${process.pid}, RSS ${rssMb()} MB, deadline in ${CONFIG.durationMin} min`);
+  log.info(`Watcher v9.2 starting — PID ${process.pid}, RSS ${rssMb()} MB, deadline in ${CONFIG.durationMin} min`);
 
   await registerBotCommands();
 
@@ -1410,5 +1598,5 @@ function setupShutdownHandlers() {
   }
 
   try { saveState(loadState()); } catch {}
-  log.info(`Watcher v9.1 exiting — final RSS ${rssMb()} MB`);
+  log.info(`Watcher v9.2 exiting — final RSS ${rssMb()} MB`);
 })();
