@@ -1,24 +1,26 @@
-name: DULMS Watcher
+name: DULMS Watcher 24-7
 
 on:
   schedule:
-    - cron: '2-59/5 * * * *'
+    # جدول أمان احتياطي كل ساعة لإعادة الإقلاع إذا توقفت السلسلة
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 concurrency:
-  group: dulms-watcher
+  group: dulms-watcher-relay
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
+  actions: write
 
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 65
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Restore state and session
@@ -28,33 +30,32 @@ jobs:
             .dulms-state.json
             .dulms-session.json
             .dulms-session-meta.json
-          key: dulms-v4
+          key: dulms-session-${{ github.run_id }}
           restore-keys: |
-            dulms-v4
-            dulms-v33
-            dulms-state-v3
+            dulms-session-
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: 'npm'
 
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        run: npm ci || npm install --no-audit --no-fund
 
-      - name: Install Playwright Chromium
+      - name: Install Chromium with system dependencies
         run: npx playwright install chromium --with-deps
 
-      - name: Run watcher
+      - name: Run DULMS Watcher Loop (50 Minutes)
         env:
           DULMS_USERNAME: ${{ secrets.DULMS_USERNAME }}
           DULMS_PASSWORD: ${{ secrets.DULMS_PASSWORD }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          DURATION_MIN: '4.5'
+          DURATION_MIN: '50'
         run: node watch.js
 
-      - name: Save state and session
+      - name: Save session state to Cache
         if: always()
         uses: actions/cache/save@v4
         with:
@@ -62,25 +63,23 @@ jobs:
             .dulms-state.json
             .dulms-session.json
             .dulms-session-meta.json
-          key: dulms-v4
+          key: dulms-session-${{ github.run_id }}
 
-      - name: Upload state as artifact backup
+      - name: Backup state to Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dulms-state-backup
           path: .dulms-state.json
-          retention-days: 30
+          retention-days: 7
           overwrite: true
           if-no-files-found: ignore
 
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: failure-logs
-          path: |
-            .dulms-state.json
-            .dulms-session-meta.json
-          retention-days: 3
-          if-no-files-found: ignore
+      # سر الاستمرار 24/7: استدعاء الجلسة القادمة فوراً لتستلم الراية
+      - name: Trigger next relay run (24/7 Handshake)
+        if: always()
+        run: |
+          echo "Triggering next relay execution..."
+          gh workflow run watcher.yml --ref main || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
