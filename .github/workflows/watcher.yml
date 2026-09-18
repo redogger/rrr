@@ -1,4 +1,4 @@
-name: DULMS Watcher 24-7 (v9.1)
+name: DULMS Watcher 24-7 (v9.2)
 
 on:
   schedule:
@@ -24,8 +24,7 @@ jobs:
     timeout-minutes: 65
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Restore state (cache)
         uses: actions/cache/restore@v4
@@ -35,11 +34,11 @@ jobs:
             .dulms-session.json
             .dulms-session-meta.json
             .dulms-audit.log
-          key: dulms-state-v91-${{ github.run_id }}
+          key: dulms-state-v92-${{ github.run_id }}
           restore-keys: |
+            dulms-state-v92-
             dulms-state-v91-
             dulms-state-v9-
-            dulms-state-v8-
             dulms-session-
 
       - name: Restore state (artifact fallback)
@@ -47,19 +46,15 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: dulms-state-v91
+          name: dulms-state-v92
           path: .
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
 
-      - name: Install dependencies
-        run: npm install --no-audit --no-fund
-
-      - name: Install Chromium
-        run: npx playwright install chromium --with-deps
+      - run: npm install --no-audit --no-fund
+      - run: npx playwright install chromium --with-deps
 
       - name: Run watcher
         env:
@@ -80,13 +75,13 @@ jobs:
             .dulms-session.json
             .dulms-session-meta.json
             .dulms-audit.log
-          key: dulms-state-v91-${{ github.run_id }}
+          key: dulms-state-v92-${{ github.run_id }}
 
       - name: Save state (artifact backup)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dulms-state-v91
+          name: dulms-state-v92
           path: |
             .dulms-state.json
             .dulms-session.json
