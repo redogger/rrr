@@ -1,20 +1,15 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- *  DULMS Watcher v10.3 — AJAX + 10s Early Detection (hardened single-file)
+ *  DULMS Watcher v10.4 — AJAX + 10s Early Detection (hardened)
  *  ---------------------------------------------------------------------------
- *  Improvements over v10.2:
- *   ✅ Pause no longer blocks Telegram → /resume always works
- *   ✅ createBrowser wrapped in try/catch → relay survives launch failures
- *   ✅ Target uses state.targetCourseCode || USER_CONFIG.targetCourse
- *   ✅ Callback data uses short IDs (Arabic group names no longer truncated)
- *   ✅ Shutdown handler writes the live state via setCurrentState()
- *   ✅ TG 400 errors logged; 429 still re-queued
- *   ✅ /reset clears early-detection counters + pendingCallbacks
- *   ✅ Long messages truncated to fit Telegram's 4096-char limit
- *   ✅ AJAX interception logs only when the course count changes
- *   ✅ Timer drift fixed (intervals no longer accumulate)
- *   ✅ Proactive session renewal every ~12 min
- *   ✅ Every silent catch{} now logs a warning
- *   ✅ chat_id sent as Number to setMyCommands when possible
+ *  v10.4 changelog:
+ *   ✅ FIX #1: State saved BEFORE any network op → survives login failure
+ *   ✅ FIX #2: TG notification on fatal crash with error text
+ *   ✅ FIX #3: Login failure dumps page text + auto-classifies cause
+ *   ✅ FIX #4: watcher.yml dumps state on failure (see workflow)
+ *   ✅ NEW:   Auto-resume if paused from previous run
+ *   ✅ NEW:   Multi-selector login (4 attempts, backoff+jitter)
+ *   ✅ NEW:   Login failure taxonomy (captcha/creds/locked/maintenance)
+ *   ✅ NEW:   counters.loginFailures + state.lastError diagnostics
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 'use strict';
@@ -43,7 +38,10 @@ const USER_CONFIG = {
   notifyWithSound:          true,
   maxTelegramPerMin:        20,
   startupBriefHours:        12,
-  sessionRenewEveryMs:      12 * 60 * 1000,   // ✅ IMPROVE: proactive renewal
+  sessionRenewEveryMs:      12 * 60 * 1000,
+
+  loginMaxAttempts:         4,
+  loginBaseDelayMs:         2_000,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -78,10 +76,11 @@ const CONFIG = {
   auditFile:       path.join(process.cwd(), '.dulms-audit.log'),
   auditMaxBytes:   1 * 1024 * 1024,
 
-  tgMessageMaxChars: 3800,   // ✅ FIX: Telegram hard-limit is 4096
+  tgMessageMaxChars: 3800,
 
   timezone:     'Africa/Cairo',
-  stateVersion: 103,
+  stateVersion: 104,
+  versionLabel: 'v10.4.0',
 };
 
 const RESULT = Object.freeze({ COMPLETED: 'completed', REBUILD: 'rebuild', FATAL: 'fatal' });
@@ -114,7 +113,6 @@ const escapeHtml = (s) => String(s).replace(/[&<>"']/g, c => (
 
 const normalizeCode = (s) => String(s || '').toUpperCase().replace(/\s+/g, '').replace(/-/g, '');
 
-// ✅ IMPROVE: central truncation helper
 function truncateForTelegram(s, max = CONFIG.tgMessageMaxChars) {
   const str = String(s ?? '');
   if (str.length <= max) return str;
@@ -183,20 +181,25 @@ function defaultState() {
     targetCourseName:     null,
     targetCourseStatus:   null,
     openGroupsState:      {},
-    pendingCallbacks:     {},      // ✅ FIX: short-id map for inline buttons
-    _cbCounter:           0,       // ✅ FIX
+    pendingCallbacks:     {},
+    _cbCounter:           0,
     lastTgUpdateId:       0,
     tgChatId:             null,
     watchedGroups:        [...USER_CONFIG.preferredGroups],
     startupBriefedAt:     0,
     paused:               false,
+    lastError:            null,
     earlyDetection: {
       enabled:    USER_CONFIG.earlyDetectionEnabled,
       checks:     0, hits: 0,
       lastCheck:  0, lastFound: 0, notifiedAt: 0,
     },
     audit:    [],
-    counters: { opens: 0, closes: 0, drops: 0, adds: 0, relogins: 0, errors: 0, alertsSent: 0 },
+    counters: {
+      opens: 0, closes: 0, drops: 0, adds: 0,
+      relogins: 0, errors: 0, alertsSent: 0,
+      loginFailures: 0, scans: 0,
+    },
   };
 }
 
@@ -237,10 +240,8 @@ function audit(state, event, details = {}) {
   }
 }
 
-// ✅ FIX: keep a live reference to the current state so SIGTERM persists it
 let _currentState = null;
 function setCurrentState(s) { _currentState = s; }
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  TELEGRAM — sending
 // ═══════════════════════════════════════════════════════════════════════════
@@ -282,7 +283,6 @@ async function tgSend(html, { silent = false, replyMarkup = null } = {}) {
             tgQueue.unshift({ html: msg, silent: sil, replyMarkup: rm });
             await sleep(r * 1000);
           } else {
-            // ✅ FIX: surface non-429 errors
             log.warn(`TG send rejected (${body.error_code || '?'}): ${body.description || 'unknown'}`);
           }
         }
@@ -293,7 +293,7 @@ async function tgSend(html, { silent = false, replyMarkup = null } = {}) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  TELEGRAM — keyboards + commands menu
+//  TELEGRAM — keyboards + commands
 // ═══════════════════════════════════════════════════════════════════════════
 const MAIN_KEYBOARD = {
   keyboard: [
@@ -335,7 +335,6 @@ const BOT_COMMANDS = [
 async function registerBotCommands() {
   if (!CONFIG.tgToken || !CONFIG.tgChatId) return;
   try {
-    // ✅ FIX: Telegram prefers a numeric chat_id in scope
     const chatIdNum = Number(CONFIG.tgChatId);
     const scope = Number.isFinite(chatIdNum)
       ? { type: 'chat', chat_id: chatIdNum }
@@ -348,7 +347,6 @@ async function registerBotCommands() {
   } catch (e) { log.warn('Command registration failed:', e.message); }
 }
 
-// ✅ FIX: short-id registry so inline callback_data stays ≤ 64 bytes
 function registerPendingGroup(state, name) {
   state._cbCounter = (state._cbCounter || 0) + 1;
   const id = 'g' + state._cbCounter;
@@ -362,7 +360,7 @@ function registerPendingGroup(state, name) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  TELEGRAM — polling + commands
+//  TELEGRAM — polling
 // ═══════════════════════════════════════════════════════════════════════════
 async function handleTelegramCommands(state, api) {
   if (!CONFIG.tgToken) return;
@@ -393,10 +391,7 @@ async function handleTelegramCommands(state, api) {
       await dispatchCommand(cmd, args, state, api);
     }
     saveState(state);
-  } catch (e) {
-    // ✅ FIX: log instead of silently swallowing
-    log.warn('TG poll failed:', e.message);
-  }
+  } catch (e) { log.warn('TG poll failed:', e.message); }
 }
 
 async function answerCallback(id, text = '') {
@@ -435,6 +430,9 @@ async function handleCallback(cb, state) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  TELEGRAM — command dispatch
+// ═══════════════════════════════════════════════════════════════════════════
 async function dispatchCommand(cmd, args, state, api) {
   const uptimeMin = Math.floor((Date.now() - (state.startedAt || Date.now())) / 60_000);
   const targetCode = state.targetCourseCode || USER_CONFIG.targetCourse;
@@ -453,17 +451,21 @@ async function dispatchCommand(cmd, args, state, api) {
       const target = state.targetCourseId ? `<code>${escapeHtml(state.targetCourseId)}</code>` : '⏳ waiting';
       const ed = state.earlyDetection || {};
       const openCount = Object.values(state.openGroupsState).filter(g => g.open).length;
+      const errLine = state.lastError
+        ? `\n⚠️ Last error: <code>${escapeHtml(String(state.lastError.message || '').slice(0, 120))}</code>`
+        : '';
       await tgSend(
-        `🟢 <b>Watcher v10.3</b>\n` +
+        `🟢 <b>Watcher ${CONFIG.versionLabel}</b>\n` +
         `⏱ <b>${uptimeMin} min</b> | 💾 <b>${rssMb()} MB</b> | ${state.paused ? '⏸ PAUSED' : '▶️ Running'}\n\n` +
         `🎯 Target: <b>${escapeHtml(targetCode)}</b> (${target})\n` +
         `📋 Status: ${state.targetCourseStatus != null ? statusLabel(state.targetCourseStatus) : '—'}\n` +
         `🕐 Early: <b>${ed.enabled ? '🟢 ON (10s)' : '🔴 OFF'}</b> | checks: <b>${ed.checks || 0}</b> | hits: <b>${ed.hits || 0}</b>\n` +
         `👁️ Watching: ${state.watchedGroups.length ? state.watchedGroups.map(escapeHtml).join(', ') : '<i>all</i>'}\n` +
-        `🔥 Open now: <b>${openCount}</b>\n\n` +
+        `🔥 Open now: <b>${openCount}</b>${errLine}\n\n` +
         `🛡️ Baseline (${state.registeredCourses.length}): ${regs}\n\n` +
         `📊 opens=<b>${state.counters.opens}</b> drops=<b>${state.counters.drops}</b> adds=<b>${state.counters.adds}</b> ` +
-        `alerts=<b>${state.counters.alertsSent}</b> relogins=<b>${state.counters.relogins}</b> errors=<b>${state.counters.errors}</b>`
+        `alerts=<b>${state.counters.alertsSent}</b> relogins=<b>${state.counters.relogins}</b> ` +
+        `errors=<b>${state.counters.errors}</b> loginFails=<b>${state.counters.loginFailures || 0}</b>`
       );
       break;
     }
@@ -524,7 +526,6 @@ async function dispatchCommand(cmd, args, state, api) {
       matches.slice(0, 20).forEach((c, i) => {
         msg += `${i+1}. <code>${escapeHtml(c.code)}</code> — ${escapeHtml(c.name)}\n   ${statusLabel(c.status)} | ID: <code>${escapeHtml(c.id)}</code>\n\n`;
       });
-      // ✅ IMPROVE: truncate inside tgSend() already handles this
       await tgSend(msg);
       break;
     }
@@ -557,8 +558,6 @@ async function dispatchCommand(cmd, args, state, api) {
         msg += `${w ? '👁️ ' : ''}${g.available ? '🔥' : '❄️'} <b>${escapeHtml(g.name)}</b> — 💺 ${g.seats}/${g.total}\n`;
         if (g.slots[0]) msg += `   📅 ${escapeHtml(g.slots[0].day)} | ⏰ ${escapeHtml(g.slots[0].time)}\n`;
       });
-
-      // ✅ FIX: short callback IDs — Arabic names no longer truncated
       const avail = sorted.filter(g => g.available).slice(0, 8);
       const rows = avail.map(g => {
         const id = registerPendingGroup(state, g.name);
@@ -648,9 +647,9 @@ async function dispatchCommand(cmd, args, state, api) {
       state.targetCourseStatus = null;
       state.watchedGroups      = [];
       state.openGroupsState    = {};
-      state.pendingCallbacks   = {};    // ✅ FIX
+      state.pendingCallbacks   = {};
       const ed = state.earlyDetection = state.earlyDetection || {};
-      ed.checks = 0; ed.hits = 0; ed.lastFound = 0; ed.notifiedAt = 0; ed.lastCheck = 0;  // ✅ FIX
+      ed.checks = 0; ed.hits = 0; ed.lastFound = 0; ed.notifiedAt = 0; ed.lastCheck = 0;
       audit(state, 'reset');
       saveState(state);
       await tgSend(`🔄 Reset complete.`);
@@ -723,7 +722,52 @@ async function createAuthContext(browser, useCookies = true) {
   return browser.newContext(opts);
 }
 
-async function loginAndCaptureCookies(browser) {
+// ─── Login helpers (multi-selector + classification) ────────────────────────
+const LOGIN_SELECTORS = {
+  user: [
+    'input[name="txtUserName"]',
+    'input[name="txtUsername"]',
+    'input[name="username"]',
+    'input[id*="UserName"]',
+    'input[id*="Username"]',
+    'input[type="text"]',
+  ],
+  pass: [
+    'input[name="txtPassword"]',
+    'input[name="password"]',
+    'input[id*="Password"]',
+    'input[type="password"]',
+  ],
+  submit: [
+    'input[name="btnLogin"]',
+    'input[name="btnSignIn"]',
+    'input[type="submit"]',
+    'button[type="submit"]',
+  ],
+};
+
+async function firstMatch(page, selectors) {
+  for (const sel of selectors) {
+    try {
+      const loc = page.locator(sel).first();
+      const count = await loc.count();
+      if (count > 0) return loc;
+    } catch {}
+  }
+  return null;
+}
+
+function classifyLoginFailure({ url = '', title = '', body = '' }) {
+  const all = (url + ' ' + title + ' ' + body).toLowerCase();
+  if (/captcha|recaptcha|robot|are you human|verify you are/i.test(all)) return 'captcha_required';
+  if (/locked|disabled|blocked|suspended/i.test(all))                    return 'account_locked';
+  if (/invalid|incorrect|wrong password|bad credentials|كلمة المرور|خطأ/i.test(all)) return 'invalid_credentials';
+  if (/maintenance|temporarily unavailable|under construction/i.test(all)) return 'site_maintenance';
+  if (/login\.aspx/i.test(url) && body.trim().length === 0)              return 'blank_login_page';
+  return 'unknown';
+}
+
+async function loginAndCaptureCookies(browser, state) {
   log.info('Logging in…');
   const ctx = await browser.newContext({
     viewport: { width: 1280, height: 720 },
@@ -738,23 +782,78 @@ async function loginAndCaptureCookies(browser) {
   });
   await page.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
 
-  await retry(async () => {
-    await page.goto(CONFIG.loginUrl, { waitUntil: 'domcontentloaded', timeout: CONFIG.pageTimeoutMs });
-    await page.fill('input[type="text"]', CONFIG.username);
-    await page.fill('input[type="password"]', CONFIG.password);
-    await Promise.all([
-      page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {}),
-      page.click('input[type="submit"], button[type="submit"]'),
-    ]);
-    if (page.url().includes('/Login.aspx')) throw new Error('Login failed');
-  }, { attempts: 3, baseMs: 1_500, label: 'login' });
+  let lastErr = null;
+  const MAX = USER_CONFIG.loginMaxAttempts;
 
-  await saveSession(ctx);
-  await ctx.close();
-  log.ok('Logged in');
-}
+  for (let attempt = 1; attempt <= MAX; attempt++) {
+    try {
+      log.info(`Login attempt ${attempt}/${MAX}…`);
+      await page.goto(CONFIG.loginUrl, { waitUntil: 'domcontentloaded', timeout: CONFIG.pageTimeoutMs });
 
-// ═══════════════════════════════════════════════════════════════════════════
+      const userEl   = await firstMatch(page, LOGIN_SELECTORS.user);
+      const passEl   = await firstMatch(page, LOGIN_SELECTORS.pass);
+      const submitEl = await firstMatch(page, LOGIN_SELECTORS.submit);
+
+      if (!userEl || !passEl || !submitEl) {
+        throw new Error(
+          `Login form not found (user=${!!userEl} pass=${!!passEl} submit=${!!submitEl})`
+        );
+      }
+
+      await userEl.fill(CONFIG.username);
+      await passEl.fill(CONFIG.password);
+      await Promise.all([
+        page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {}),
+        submitEl.click(),
+      ]);
+      await sleep(800);
+
+      const finalUrl = page.url();
+      const stillOnLogin =
+        finalUrl.includes('/Login.aspx') ||
+        /\/login(\?|$)/i.test(finalUrl);
+
+      if (stillOnLogin) {
+        // ✅ FIX #3: capture page text for diagnosis
+        const title = await page.title().catch(() => '');
+        const body  = await page.locator('body').innerText().catch(() => '');
+        const snippet = body.replace(/\s+/g, ' ').trim().slice(0, 400);
+        const cause = classifyLoginFailure({ url: finalUrl, title, body });
+
+        const detail = `cause=${cause} url="${finalUrl}" title="${title}" body="${snippet}"`;
+        log.warn(`Login failed: ${detail}`);
+
+        // Attach detail to the thrown error so the caller can persist it
+        const err = new Error(`Login failed [${cause}]: ${detail}`);
+        err.loginCause = cause;
+        err.loginUrl   = finalUrl;
+        err.loginTitle = title;
+        err.loginBody  = snippet;
+        throw err;
+      }
+
+      // Success
+      await saveSession(ctx);
+      await ctx.close();
+      log.ok(`Logged in (attempt ${attempt})`);
+      return;
+    } catch (e) {
+      lastErr = e;
+      log.warn(`Attempt ${attempt}/${MAX} failed: ${String(e.message || e).slice(0, 200)}`);
+
+      if (attempt >= MAX) break;
+
+      const wait = USER_CONFIG.loginBaseDelayMs * attempt + Math.floor(Math.random() * 1500);
+      log.info(`Waiting ${wait}ms before retry…`);
+      await sleep(wait);
+
+      try { await page.goto(CONFIG.loginUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 }); } catch {}
+    }
+  }
+
+  try { await ctx.close(); } catch {}
+  throw lastErr || new Error('Login failed after all attempts');
+}// ═══════════════════════════════════════════════════════════════════════════
 //  AJAX INTERCEPTION
 // ═══════════════════════════════════════════════════════════════════════════
 async function setupAJAXInterception(ctx, pageRef) {
@@ -775,7 +874,6 @@ async function setupAJAXInterception(ctx, pageRef) {
           const prev = pageRef.lastAJAX?.length || 0;
           pageRef.lastAJAX = json;
           pageRef.ajaxTime = Date.now();
-          // ✅ FIX: no more spam — only log on change
           if (json.length !== prev) log.ok(`Intercepted AJAX: ${json.length} courses (was ${prev})`);
         }
       } catch (e) { log.warn('AJAX parse failed:', e.message); }
@@ -902,7 +1000,6 @@ function makeApi(ctx, pageRef) {
         return { kind: 'ok', courses: courseCache.data };
       }
 
-      // Priority 1: fresh AJAX (< 60s)
       if (pageRef.lastAJAX && pageRef.lastAJAX.length > 0 &&
           Date.now() - pageRef.ajaxTime < 60_000) {
         const list = mapCourses(pageRef.lastAJAX);
@@ -910,7 +1007,6 @@ function makeApi(ctx, pageRef) {
         return { kind: 'ok', courses: list };
       }
 
-      // Priority 2: force reload
       await triggerAjax();
 
       if (pageRef.lastAJAX && pageRef.lastAJAX.length > 0) {
@@ -919,7 +1015,6 @@ function makeApi(ctx, pageRef) {
         return { kind: 'ok', courses: list };
       }
 
-      // Priority 3: direct fetch fallback
       log.warn('getCourses: AJAX failed, using direct fetch');
       const r = await fetchInPage(
         CONFIG.API.coursesList +
@@ -965,7 +1060,6 @@ async function earlyDetectionCheck(api, state) {
   state.earlyDetection.checks++;
   state.earlyDetection.lastCheck = Date.now();
 
-  // ✅ FIX: use the live target, not the hardcoded config
   const query = state.targetCourseCode || USER_CONFIG.targetCourse;
   const r = await api.getCourses({ forceRefresh: true });
   if (r.kind !== 'ok') {
@@ -1129,24 +1223,55 @@ async function sniperCheck(api, state) {
 //  MAIN LOOP
 // ═══════════════════════════════════════════════════════════════════════════
 async function runScan(browser, deadline) {
+  // ✅ FIX #1: save state BEFORE any network op
+  const state = loadState();
+  state.startedAt = Date.now();
+  state.counters.scans = (state.counters.scans || 0) + 1;
+  if (!state.earlyDetection) state.earlyDetection = defaultState().earlyDetection;
+
+  // Auto-resume if paused from a previous run
+  if (state.paused) {
+    log.warn('Was PAUSED from a previous run — auto-resuming');
+    state.paused = false;
+    audit(state, 'auto_resume');
+  }
+
+  setCurrentState(state);
+  saveState(state);
+  log.ok(`State initialized at ${CONFIG.stateFile}`);
+
+  // Login (guarded)
   if (!fs.existsSync(CONFIG.sessionFile) || sessionAgeMinutes() > CONFIG.cookieMaxAgeMin) {
     cleanupSession();
-    await loginAndCaptureCookies(browser);
+    try {
+      await loginAndCaptureCookies(browser, state);
+      state.lastError = null;
+      saveState(state);
+    } catch (e) {
+      state.counters.loginFailures = (state.counters.loginFailures || 0) + 1;
+      state.counters.errors = (state.counters.errors || 0) + 1;
+      state.lastError = {
+        t: Date.now(),
+        phase: 'login',
+        cause: e.loginCause || 'unknown',
+        message: String(e.message || e).slice(0, 500),
+        url: e.loginUrl || null,
+        title: e.loginTitle || null,
+        body: e.loginBody || null,
+      };
+      audit(state, 'login_failed', {
+        cause: e.loginCause || 'unknown',
+        msg: String(e.message || e).slice(0, 200),
+      });
+      saveState(state);
+      throw e;
+    }
   }
 
   let ctx = await createAuthContext(browser, true);
-
   const pageRef = { page: null, lastAJAX: null, ajaxTime: 0 };
   await setupAJAXInterception(ctx, pageRef);
-
   let api = makeApi(ctx, pageRef);
-
-  const state = loadState();
-  state.startedAt = Date.now();
-  if (!state.earlyDetection) state.earlyDetection = defaultState().earlyDetection;
-
-  // ✅ FIX: expose live state to the shutdown handler
-  setCurrentState(state);
 
   // Chat migration
   if (!state.tgChatId) state.tgChatId = CONFIG.tgChatId;
@@ -1162,7 +1287,7 @@ async function runScan(browser, deadline) {
     state.startupBriefedAt = Date.now();
     const targetLabel = state.targetCourseCode || USER_CONFIG.targetCourse;
     await tgSend(
-      `🚀 <b>Watcher v10.3</b>\n\n` +
+      `🚀 <b>Watcher ${CONFIG.versionLabel}</b>\n\n` +
       `🎯 Sniping <b>${escapeHtml(targetLabel)}</b>\n` +
       `🕐 Early Detection: <b>ON — every 10s</b>\n` +
       `🛡️ Guarding <b>${state.registeredCourses.length}</b> courses\n\n` +
@@ -1181,14 +1306,13 @@ async function runScan(browser, deadline) {
     telegram:       Date.now() + 1_000,
     memory:         Date.now() + 60_000,
     pageHealth:     Date.now() + 30_000,
-    sessionRenew:   Date.now() + USER_CONFIG.sessionRenewEveryMs,   // ✅ IMPROVE
+    sessionRenew:   Date.now() + USER_CONFIG.sessionRenewEveryMs,
   };
 
   while (Date.now() < deadline) {
     const now = Date.now();
 
-    // ── Telegram (ALWAYS runs, even when paused) ──────────────────
-    // ✅ FIX: pause check moved below so /resume always reaches us
+    // Telegram (always runs, even when paused)
     if (now >= timers.telegram) {
       await handleTelegramCommands(state, api);
       timers.telegram = Date.now() + USER_CONFIG.telegramPollMs;
@@ -1196,7 +1320,7 @@ async function runScan(browser, deadline) {
 
     if (state.paused) { await sleep(1000); continue; }
 
-    // ── Memory watchdog ───────────────────────────────────────────
+    // Memory watchdog
     if (now >= timers.memory) {
       const mb = rssMb();
       if (mb >= CONFIG.memRestartMb) {
@@ -1210,7 +1334,7 @@ async function runScan(browser, deadline) {
       timers.memory = Date.now() + 60_000;
     }
 
-    // ── Page health ────────────────────────────────────────────────
+    // Page health
     if (now >= timers.pageHealth) {
       try {
         if (!pageRef.page || pageRef.page.isClosed()) {
@@ -1222,10 +1346,9 @@ async function runScan(browser, deadline) {
       timers.pageHealth = Date.now() + 30_000;
     }
 
-    // ── Proactive session renewal ─────────────────────────────────
+    // Session renewal
     if (now >= timers.sessionRenew) {
       try {
-        log.info('Proactive session renewal…');
         await saveSession(ctx);
         timers.sessionRenew = Date.now() + USER_CONFIG.sessionRenewEveryMs;
       } catch (e) {
@@ -1234,19 +1357,18 @@ async function runScan(browser, deadline) {
       }
     }
 
-    // ── Early Detection ────────────────────────────────────────────
+    // Early Detection
     if (!state.targetCourseId && state.earlyDetection.enabled && now >= timers.earlyDetection) {
       try {
         const ed = await earlyDetectionCheck(api, state);
         if (ed.found) log.ok('🎉 Early detection HIT!');
       } catch (e) { log.warn('Early detection error:', e.message); }
-      // ✅ IMPROVE: interval added to previous fire time (no drift)
       timers.earlyDetection += USER_CONFIG.earlyDetectionIntervalMs;
       if (timers.earlyDetection < Date.now()) timers.earlyDetection = Date.now() + USER_CONFIG.earlyDetectionIntervalMs;
       saveState(state);
     }
 
-    // ── Security baseline ──────────────────────────────────────────
+    // Security baseline
     if (now >= timers.security) {
       try {
         const sr = await verifyRegistrationStability(api, state);
@@ -1255,7 +1377,7 @@ async function runScan(browser, deadline) {
           state.counters.relogins++;
           try { await ctx.close(); } catch {}
           cleanupSession();
-          await loginAndCaptureCookies(browser);
+          await loginAndCaptureCookies(browser, state);
           ctx = await createAuthContext(browser, true);
           await setupAJAXInterception(ctx, pageRef);
           api = makeApi(ctx, pageRef);
@@ -1273,7 +1395,7 @@ async function runScan(browser, deadline) {
       }
     }
 
-    // ── Sniper ─────────────────────────────────────────────────────
+    // Sniper
     if (state.targetCourseId && now >= timers.sniper) {
       try {
         const sr = await sniperCheck(api, state);
@@ -1282,7 +1404,7 @@ async function runScan(browser, deadline) {
           state.counters.relogins++;
           try { await ctx.close(); } catch {}
           cleanupSession();
-          await loginAndCaptureCookies(browser);
+          await loginAndCaptureCookies(browser, state);
           ctx = await createAuthContext(browser, true);
           await setupAJAXInterception(ctx, pageRef);
           api = makeApi(ctx, pageRef);
@@ -1291,7 +1413,6 @@ async function runScan(browser, deadline) {
           state.counters.errors++;
           timers.sniper = Date.now() + 30_000;
         } else {
-          // ✅ IMPROVE: keep sniper aligned to its own cadence
           timers.sniper += USER_CONFIG.sniperIntervalMs;
           if (timers.sniper < Date.now()) timers.sniper = Date.now() + USER_CONFIG.sniperIntervalMs;
         }
@@ -1317,7 +1438,6 @@ function setupShutdownHandlers() {
     if (shuttingDown) return;
     shuttingDown = true;
     log.warn(`${sig} — saving state`);
-    // ✅ FIX: persist the LIVE state, not a fresh reload
     if (_currentState) { try { saveState(_currentState); } catch {} }
     process.exit(0);
   };
@@ -1338,7 +1458,7 @@ function setupShutdownHandlers() {
   const startTs = Date.now();
   const deadline = startTs + CONFIG.durationMin * 60_000;
 
-  log.info(`Watcher v10.3 — PID ${process.pid}, RSS ${rssMb()} MB, ${CONFIG.durationMin} min`);
+  log.info(`Watcher ${CONFIG.versionLabel} — PID ${process.pid}, RSS ${rssMb()} MB, ${CONFIG.durationMin} min`);
 
   await registerBotCommands();
 
@@ -1348,7 +1468,6 @@ function setupShutdownHandlers() {
   while (Date.now() < deadline && iter < maxIter) {
     iter++;
 
-    // ✅ FIX: browser launch in try/catch — relay no longer dies on failures
     let browser;
     try {
       browser = await createBrowser();
@@ -1365,6 +1484,30 @@ function setupShutdownHandlers() {
       log.err('Fatal:', e.message);
       if (e.stack) console.error(e.stack);
       result = RESULT.FATAL;
+
+      // ✅ FIX #2: notify user + persist lastError
+      try {
+        const state = _currentState || loadState();
+        state.counters.errors = (state.counters.errors || 0) + 1;
+        state.lastError = {
+          t: Date.now(),
+          phase: 'fatal',
+          message: String(e.message || e).slice(0, 500),
+        };
+        audit(state, 'fatal', { message: String(e.message || e).slice(0, 200) });
+        saveState(state);
+
+        const errSummary = String(e.message || e).slice(0, 400);
+        await tgSend(
+          `💥 <b>Watcher crashed</b>\n\n` +
+          `<code>${escapeHtml(errSummary)}</code>\n\n` +
+          `🕐 ${new Date().toISOString().slice(11, 19)} UTC\n` +
+          `🔁 Iteration ${iter}/${maxIter}`,
+          { silent: false }
+        );
+      } catch (notifyErr) {
+        log.warn('Failed to notify about crash:', notifyErr.message);
+      }
     } finally {
       try { await browser.close(); } catch {}
     }
@@ -1374,7 +1517,6 @@ function setupShutdownHandlers() {
     if (result === RESULT.FATAL)     { log.err('Fatal — aborting'); break; }
   }
 
-  // Final flush — uses the live state if available, otherwise whatever is on disk
   try {
     if (_currentState) saveState(_currentState);
     else saveState(loadState());
