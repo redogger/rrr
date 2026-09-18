@@ -1,15 +1,9 @@
 {
   "name": "dulms-watcher",
-  "version": "9.4.0",
-  "description": "DULMS Watcher — Authenticated Context Edition with AJAX interception",
+  "version": "10.0.0",
+  "description": "DULMS Watcher — Rapid 10s Early Detection",
   "main": "watch.js",
-  "scripts": {
-    "start": "node watch.js"
-  },
-  "dependencies": {
-    "playwright": "^1.49.0"
-  },
-  "engines": {
-    "node": ">=20"
-  }
+  "scripts": { "start": "node watch.js" },
+  "dependencies": { "playwright": "^1.49.0" },
+  "engines": { "node": ">=20" }
 }
