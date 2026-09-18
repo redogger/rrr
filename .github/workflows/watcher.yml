@@ -1,4 +1,4 @@
-name: DULMS Watcher 24-7 (v10.0)
+name: DULMS Watcher 24-7 (v10.2)
 
 on:
   schedule:
@@ -35,11 +35,11 @@ jobs:
             .dulms-session.json
             .dulms-session-meta.json
             .dulms-audit.log
-          key: dulms-state-v100-${{ github.run_id }}
+          key: dulms-state-v102-${{ github.run_id }}
           restore-keys: |
+            dulms-state-v102-
             dulms-state-v100-
             dulms-state-v95-
-            dulms-state-v94-
             dulms-session-
 
       - name: Restore state (artifact fallback)
@@ -47,7 +47,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: dulms-state-v100
+          name: dulms-state-v102
           path: .
 
       - name: Setup Node.js
@@ -81,14 +81,14 @@ jobs:
             .dulms-session.json
             .dulms-session-meta.json
             .dulms-audit.log
-          key: dulms-state-v100-${{ github.run_id }}
+          key: dulms-state-v102-${{ github.run_id }}
 
       - name: Save state (artifact)
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: dulms-state-v100
+          name: dulms-state-v102
           path: |
             .dulms-state.json
             .dulms-session.json
