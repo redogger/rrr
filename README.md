@@ -1,38 +1,29 @@
-# DULMS Watcher v4.0
+# 👁️ DULMS Watcher v4.5 — محرك المراقبة المستمرة 24/7
 
-بوت مراقبة كورسات DULMS مع إشعارات Telegram ذكية.
+نظام فحص ذكي ومستمر لمراقبة فتح مقررات جامعة الدلتا (DULMS) عبر GitHub Actions بنظام التتابع المتواصل (Relay Engine).
 
-## المميزات
+## ⚙️ التجهيز السريع
 
-- **Cookie-first**: يحتفظ بالجلسة حتى تنتهي (من `storageState`)
-- **Smart Dedup**: لا يكرر الإشعارات لنفس الكورس
-- **Always-Notify**: مواد معينة تُشعر دائماً (مثل ENG)
-- **Never-Notify**: مواد معينة تُتجاهل
-- **Fast fetch**: كل 10 ثواني
-- **Auto re-login**: عند موت الجلسة فقط
-- **Baseline on first run**: لا spam
-- **Rate limiting**: يتعامل مع 429 من Telegram تلقائياً
-- **Persistent state**: في GitHub cache + artifact backup
+### 1. ضبط البيانات السرية (GitHub Secrets)
+توجه إلى: `Settings` ➔ `Secrets and variables` ➔ `Actions` وأضف المتغيرات الآتية:
 
-## Setup
-
-### 1. Secrets (Settings → Secrets and variables → Actions)
-
-| Secret | Value |
+| المتغير | الوصف |
 |---|---|
 | `DULMS_USERNAME` | رقمك الجامعي |
-| `DULMS_PASSWORD` | كلمة السر |
-| `TG_TOKEN` | Telegram Bot Token |
-| `TG_CHAT_ID` | Telegram Chat ID |
+| `DULMS_PASSWORD` | كلمة سر حسابك الجامعي |
+| `TG_TOKEN` | توكن بوت التيليجرام |
+| `TG_CHAT_ID` | معرّف المحادثة في التيليجرام |
 
-### 2. التعديل على قائمة الإشعارات
+### 2. تفعيل صلاحيات الـ Relay للتشغيل المستمر (ضروري جداً)
+لكي يستطيع السيرفر تشغيل الجلسة التالية بنفسه 24/7:
+1. افتح مستودعك على GitHub.
+2. اذهب إلى **Settings** ➔ **Actions** ➔ **General**.
+3. انزل لأسفل حتى تصل إلى قسم **Workflow permissions**.
+4. اختر: **Read and write permissions**.
+5. ضع علامة صح أمام **Allow GitHub Actions to create and approve pull requests**.
+6. اضغط **Save**.
 
-افتح `watch.js` وعدّل:
+### 3. إطلاق النظام
+اذهب إلى تبويب **Actions** ➔ اختر **DULMS Watcher 24-7** ➔ اضغط **Run workflow**.
 
-```javascript
-const USER_CONFIG = {
-  sendBaselineMessage: false,   // لا ترسل رسالة "بدأ المراقبة"
-  alwaysNotify: ['ENG', 'ENGLISH'],
-  neverNotify: [],
-  alreadyNotified: [],
-};
+النظام سيعمل الآن 50 دقيقة لكل جولة ويستدعي الجولة التالية فوراً دون أي انقطاع.
