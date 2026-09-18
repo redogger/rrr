@@ -1,17 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════════════
- *  DULMS Watcher v4.0 — Smart Dedup + Cookie-First + Always-Notify
- *  ─────────────────────────────────────────────────────────────────────────
- *  Features:
- *    ✓ Cookie-first: reuse session until it expires
- *    ✓ Smart dedup: never notify same course twice (unless in alwaysNotify)
- *    ✓ Always-notify list: bypass dedup for specific courses (e.g., ENG)
- *    ✓ Never-notify list: silent ignore for courses you don't care about
- *    ✓ Persistent state across runs (GitHub cache + artifact backup)
- *    ✓ Fast fetch: every 10 seconds
- *    ✓ Auto re-login only when session actually dies
- *    ✓ Baseline on first run: silent, no spam
- *    ✓ Adaptive delays to prevent rate limiting
- *    ✓ Telegram notifications with detailed info
+ *  DULMS Watcher v4.5 — 24/7 Long-Run Edition (Relay & Leak Safe)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 const { chromium } = require('playwright');
@@ -19,29 +7,26 @@ const fs = require('fs');
 const path = require('path');
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  🎯 إعدادات المستخدم — عدّل هنا فقط
+//  🎯 إعدادات المستخدم
 // ═══════════════════════════════════════════════════════════════════════════
 const USER_CONFIG = {
-  // ✅ لا ترسل رسالة "بدأ المراقبة" في أول تشغيل
-  sendBaselineMessage: false,
+  sendBaselineMessage: false, // لا ترسل رسالة بدء في التشغيل التلقائي
 
-  // ⭐ المواد اللي عايز إشعار عنها **دايماً** حتى لو اتبعت قبل كده
+  // المواد المراد استلام إشعار عنها دائماً (تجاوز الفلتر)
   alwaysNotify: [
     'ENG',
     'ENGLISH',
   ],
 
-  // 🚫 المواد اللي **مش عايز** إشعارات عنها خالص
-  neverNotify: [
-    // 'MEC 151',
-  ],
+  // مواد للتجاهل الصامت
+  neverNotify: [],
 
-  // 📜 الكود بيملأها تلقائياً — متعدلهاش يدوياً
+  // يتم ملؤها برمجياً
   alreadyNotified: [],
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CONFIG
+//  الإعدادات التشغيلية
 // ═══════════════════════════════════════════════════════════════════════════
 const CONFIG = {
   baseUrl:          'https://dulms.deltauniv.edu.eg',
@@ -52,12 +37,12 @@ const CONFIG = {
   password:         process.env.DULMS_PASSWORD || '',
   tgToken:          process.env.TG_TOKEN || '',
   tgChatId:         process.env.TG_CHAT_ID || '',
-  durationMin:      parseFloat(process.env.DURATION_MIN || '4.5'),
+  durationMin:      parseFloat(process.env.DURATION_MIN || '50'), // 50 دقيقة لكل دورة
 
   fetchIntervalSec: 10,
   courseDelayMs:    500,
   cookieMaxAgeMin:  15,
-  maxRelogins:      5,
+  maxRelogins:      10,
 
   stateFile:        path.join(process.cwd(), '.dulms-state.json'),
   sessionFile:      path.join(process.cwd(), '.dulms-session.json'),
@@ -67,9 +52,6 @@ const CONFIG = {
   dryRun:           process.argv.includes('--dry-run'),
 };
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  LOGGER
-// ═══════════════════════════════════════════════════════════════════════════
 const ts = () => new Date().toISOString().slice(11, 19);
 const log = {
   info:  (...a) => console.log(`[${ts()}] [INFO]`, ...a),
@@ -84,7 +66,7 @@ const log = {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  TELEGRAM
+//  إرسال التنبيهات (Telegram API)
 // ═══════════════════════════════════════════════════════════════════════════
 let lastTgCall = 0;
 async function sendTelegram(title, body) {
@@ -122,7 +104,7 @@ async function sendTelegram(title, body) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  STATE MANAGEMENT
+//  إدارة الحالة والتخزين
 // ═══════════════════════════════════════════════════════════════════════════
 function loadState() {
   try {
@@ -150,7 +132,6 @@ function saveState(state) {
   }
 }
 
-// ═══ Session meta ═══
 function loadSessionMeta() {
   try {
     if (fs.existsSync(CONFIG.sessionMetaFile)) {
@@ -185,33 +166,29 @@ async function saveSession(ctx) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  🎯 SMART NOTIFICATION LOGIC
+//  منطق الفلترة والإشعارات الذكية
 // ═══════════════════════════════════════════════════════════════════════════
 function shouldNotify(course, result) {
   const name = course.name.toUpperCase();
   const code = course.name.split(' - ')[0].toUpperCase();
 
-  // 1. Never-notify list
   for (const skip of USER_CONFIG.neverNotify) {
     if (name.includes(skip.toUpperCase())) {
       return { notify: false, reason: 'in neverNotify list' };
     }
   }
 
-  // 2. Always-notify list (bypass dedup)
   for (const always of USER_CONFIG.alwaysNotify) {
     if (name.includes(always.toUpperCase())) {
       return { notify: true, reason: 'alwaysNotify (bypass dedup)', bypass: true };
     }
   }
 
-  // 3. Dedup
   const wasNotified = USER_CONFIG.alreadyNotified.includes(code);
   if (wasNotified) {
     return { notify: false, reason: 'already notified before (dedup)' };
   }
 
-  // 4. First time
   return { notify: true, reason: 'first time opening' };
 }
 
@@ -224,7 +201,7 @@ function markAsNotified(course) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  BROWSER
+//  إدارة المتصفح ومكافحة استهلاك الذاكرة
 // ═══════════════════════════════════════════════════════════════════════════
 async function createBrowser() {
   return await chromium.launch({
@@ -235,13 +212,14 @@ async function createBrowser() {
       '--disable-dev-shm-usage',
       '--disable-blink-features=AutomationControlled',
       '--disable-gpu',
+      '--no-zygote',
     ],
   });
 }
 
 async function createPage(browser, useCookies = true) {
   const opts = {
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     viewport: { width: 1280, height: 720 },
     locale: 'en-US',
     timezoneId: CONFIG.timezone,
@@ -258,6 +236,8 @@ async function createPage(browser, useCookies = true) {
 
   const context = await browser.newContext(opts);
   const page = await context.newPage();
+  
+  // حظر تحميل الوسائط والملفات الثقيلة لتوفير الذاكرة والشبكة
   await page.route('**/*', (route) => {
     const t = route.request().resourceType();
     if (['image', 'font', 'media', 'stylesheet'].includes(t)) return route.abort();
@@ -267,9 +247,6 @@ async function createPage(browser, useCookies = true) {
   return { context, page, cookiesLoaded };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  LOGIN
-// ═══════════════════════════════════════════════════════════════════════════
 async function findFirst(page, sels) {
   for (const s of sels) {
     try {
@@ -301,7 +278,7 @@ async function loginToDulms(page) {
   ]);
 
   if (page.url().includes('/Login.aspx')) throw new Error('Login failed');
-  log.ok('Logged in');
+  log.ok('Logged in successfully');
 }
 
 async function validateCookies(page) {
@@ -316,7 +293,7 @@ async function validateCookies(page) {
 
     const cnt = await page.locator('article.course-item').count();
     if (cnt === 0) {
-      log.warn('No courses in page');
+      log.warn('No courses found on page');
       return false;
     }
     log.ok(`Cookies valid (${cnt} courses)`);
@@ -327,9 +304,6 @@ async function validateCookies(page) {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  COURSES
-// ═══════════════════════════════════════════════════════════════════════════
 async function fetchAllCourses(page) {
   await page.goto(CONFIG.coursesUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
@@ -404,17 +378,14 @@ async function checkCourse(page, id) {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  MESSAGE FORMATTERS
-// ═══════════════════════════════════════════════════════════════════════════
 function fmtOpening(course, r, isAlwaysNotify) {
   const code = course.name.split(' - ')[0];
   const L = [`✅ *${r.count}* Group(s) متاحة للتسجيل`, ''];
 
   r.groups.slice(0, 5).forEach((g, i) => {
-    L.push(`*${i + 1}. ${g.name}*   💺 ${g.open}/${g.total}`);
+    L.push(`*${i + 1}.${g.name}*   💺 ${g.open}/${g.total}`);
     if (g.firstSlot) {
-      L.push(`   📅 ${g.firstSlot.day} | ⏰ ${g.firstSlot.time}`);
+      L.push(`   📅 ${g.firstSlot.day} \vert{} ⏰${g.firstSlot.time}`);
       if (g.firstSlot.hall) L.push(`   🏛️ ${g.firstSlot.hall}`);
     }
     if (i < Math.min(4, r.groups.length - 1)) L.push('');
@@ -433,31 +404,8 @@ function fmtOpening(course, r, isAlwaysNotify) {
   return { title: `🎉 ${code} فتح للتسجيل!`, body: L.join('\n') };
 }
 
-function fmtBaseline(watchable, state) {
-  const avail = watchable.filter(c => state.courses[c.id]?.available);
-  const L = [
-    `📚 *${watchable.length}* كورس تحت المراقبة`,
-    '',
-    `✅ *${avail.length}* متاح حالياً:`,
-    '',
-  ];
-
-  avail.slice(0, 15).forEach(c => L.push(`  • ${c.name}`));
-  if (avail.length > 15) L.push(`  _...و ${avail.length - 15} أخرى_`);
-
-  L.push('');
-  L.push(`🕐 ${new Date().toLocaleString('ar-EG', { timeZone: CONFIG.timezone })}`);
-  L.push('');
-  L.push(`⭐ *Always-Notify:* ${USER_CONFIG.alwaysNotify.join(', ') || '(empty)'}`);
-  L.push(`🚫 *Never-Notify:* ${USER_CONFIG.neverNotify.join(', ') || '(empty)'}`);
-  L.push('');
-  L.push('_ستصلك رسالة فوراً عند فتح أي كورس جديد_');
-
-  return { title: '👁️ DULMS Watcher v4.0 — بدأ المراقبة', body: L.join('\n') };
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
-//  MAIN SCAN
+//  حلقة الفحص المستمر
 // ═══════════════════════════════════════════════════════════════════════════
 async function runScan(browser) {
   let { context, page, cookiesLoaded } = await createPage(browser, true);
@@ -466,7 +414,7 @@ async function runScan(browser) {
   if (cookiesLoaded && sessionAgeMinutes() < CONFIG.cookieMaxAgeMin) {
     hasValidSession = await validateCookies(page);
   } else if (cookiesLoaded) {
-    log.warn(`Cookies too old (${sessionAgeMinutes().toFixed(1)} min)`);
+    log.warn(`Cookies expired (${sessionAgeMinutes().toFixed(1)} min)`);
     cleanupSession();
     await context.close();
     ({ context, page } = await createPage(browser, false));
@@ -475,6 +423,7 @@ async function runScan(browser) {
   const state = loadState();
   const isFirstRun = !state._lastUpdate;
   let reloginCount = 0;
+  let lastContextRefresh = Date.now();
 
   try {
     if (!hasValidSession) {
@@ -487,34 +436,31 @@ async function runScan(browser) {
     const watchable = courses.filter(c => c.status === 'never');
     log.info(`Watching ${watchable.length}/${courses.length} courses`);
 
-    if (!watchable.length) throw new Error('No watchable courses');
-
-    log.step(isFirstRun ? 'FIRST RUN — baseline (no alerts)' : 'RESUMED');
-    if (USER_CONFIG.alwaysNotify.length) {
-      log.info(`Always-Notify: ${USER_CONFIG.alwaysNotify.join(', ')}`);
-    }
-    if (USER_CONFIG.neverNotify.length) {
-      log.info(`Never-Notify: ${USER_CONFIG.neverNotify.join(', ')}`);
-    }
-    if (USER_CONFIG.alreadyNotified.length) {
-      log.info(`Already notified: ${USER_CONFIG.alreadyNotified.length} courses`);
-    }
+    if (!watchable.length) throw new Error('No watchable courses found');
 
     const endTime = Date.now() + CONFIG.durationMin * 60 * 1000;
     let cycle = 0;
 
     while (Date.now() < endTime) {
       if (fs.existsSync(CONFIG.interruptFile)) {
-        log.warn('Interrupt');
+        log.warn('Interrupt flag detected');
         try { fs.unlinkSync(CONFIG.interruptFile); } catch (e) {}
         break;
       }
 
+      // إعادة تدوير الذاكرة كل 25 دقيقة لتفادي تسريب الذاكرة في Chromium
+      if (Date.now() - lastContextRefresh > 25 * 60 * 1000) {
+        log.info('Recycling browser context to free up memory...');
+        await saveSession(context);
+        await context.close();
+        ({ context, page } = await createPage(browser, true));
+        lastContextRefresh = Date.now();
+      }
+
       const cycleStart = Date.now();
       cycle++;
-      const elapsed = ((Date.now() - (endTime - CONFIG.durationMin * 60 * 1000)) / 1000).toFixed(0);
       const left = ((endTime - Date.now()) / 1000).toFixed(0);
-      log.step(`Cycle #${cycle} | ${elapsed}s | ${left}s left | cookie: ${sessionAgeMinutes().toFixed(0)}min`);
+      log.step(`Cycle #${cycle} | ${left}s left in run \vert{} cookie:${sessionAgeMinutes().toFixed(0)}min`);
 
       let sessionDead = false;
 
@@ -525,13 +471,13 @@ async function runScan(browser) {
         const r = await checkCourse(page, course.id);
 
         if (r.sessionDead) {
-          log.warn(`Session died at [${i + 1}/${watchable.length}] ${course.name}`);
+          log.warn(`Session expired at [${i + 1}/${watchable.length}]${course.name}`);
           sessionDead = true;
           break;
         }
 
         if (r.error) {
-          log.warn(`${course.name} — ${r.error}`);
+          log.warn(`${course.name} —${r.error}`);
           continue;
         }
 
@@ -547,7 +493,7 @@ async function runScan(browser) {
             await sendTelegram(msg.title, msg.body);
             if (!decision.bypass) markAsNotified(course);
           } else {
-            log.skip(`🎉 ${course.name} — OPEN but ${decision.reason}`);
+            log.skip(`🎉 ${course.name} — OPEN but${decision.reason}`);
           }
         } else if (nowOpen) {
           log.ok(`${course.name} — متاح (${r.count})`);
@@ -566,10 +512,9 @@ async function runScan(browser) {
 
       saveState(state);
 
-      // Session died → re-login
       if (sessionDead) {
         if (reloginCount < CONFIG.maxRelogins) {
-          log.warn(`Re-login #${reloginCount + 1}`);
+          log.warn(`Re-authenticating attempt #${reloginCount + 1}`);
           try {
             cleanupSession();
             await context.close();
@@ -577,14 +522,14 @@ async function runScan(browser) {
             await loginToDulms(page);
             await saveSession(context);
             reloginCount++;
-            log.ok('Re-login ✓');
+            log.ok('Re-login completed');
             continue;
           } catch (e) {
             log.err('Re-login failed:', e.message);
             break;
           }
         } else {
-          log.err('Max re-logins reached');
+          log.err('Exceeded maximum login retries');
           break;
         }
       }
@@ -592,55 +537,40 @@ async function runScan(browser) {
       const cycleElapsed = Date.now() - cycleStart;
       const sleepTime = Math.max(0, CONFIG.fetchIntervalSec * 1000 - cycleElapsed);
       if (sleepTime > 0) {
-        log.info(`Cycle: ${(cycleElapsed / 1000).toFixed(1)}s | sleeping ${(sleepTime / 1000).toFixed(1)}s`);
         await sleep(sleepTime);
       }
     }
 
-    if (isFirstRun && USER_CONFIG.sendBaselineMessage !== false) {
-      const msg = fmtBaseline(watchable, state);
-      await sendTelegram(msg.title, msg.body);
-    }
-
-    log.step(`SCAN COMPLETE — ${cycle} cycles, ${reloginCount} logins`);
+    log.step(`CYCLE COMPLETED — Executed ${cycle} cycles successfully`);
 
   } catch (e) {
     log.err('FATAL:', e.message);
     await sendTelegram('⚠️ DULMS Watcher Error', `\`${e.message}\``);
     throw e;
   } finally {
+    await saveSession(context);
     await context.close();
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  ENTRY POINT
+//  نقطة البداية (Entrypoint)
 // ═══════════════════════════════════════════════════════════════════════════
 (async () => {
   const t0 = Date.now();
-
   console.log('\n═══════════════════════════════════════════════');
-  console.log('  🎯 DULMS Watcher v4.0 — Smart Dedup');
-  console.log('═══════════════════════════════════════════════');
-  console.log(`  User:            ${CONFIG.username ? CONFIG.username.slice(0, 4) + '***' : '(not set)'}`);
-  console.log(`  Telegram:        ${CONFIG.tgToken ? '✓' : '(not set)'}`);
-  console.log(`  Duration:        ${CONFIG.durationMin} min`);
-  console.log(`  Fetch every:     ${CONFIG.fetchIntervalSec}s`);
-  console.log(`  Cookie max age:  ${CONFIG.cookieMaxAgeMin} min`);
-  console.log(`  Always-notify:   ${USER_CONFIG.alwaysNotify.join(', ') || '(none)'}`);
-  console.log(`  Never-notify:    ${USER_CONFIG.neverNotify.join(', ') || '(none)'}`);
-  console.log(`  Node:            ${process.version}`);
+  console.log('  🎯 DULMS Watcher v4.5 — 24/7 Engine');
   console.log('═══════════════════════════════════════════════\n');
 
   if (!CONFIG.username || !CONFIG.password) {
-    log.err('Missing DULMS_USERNAME or DULMS_PASSWORD');
+    log.err('Missing credentials: DULMS_USERNAME or DULMS_PASSWORD');
     process.exit(1);
   }
 
   const browser = await createBrowser();
 
   const shutdown = async (sig) => {
-    log.warn(`Received ${sig} — shutting down`);
+    log.warn(`Received ${sig} — terminating gracefully`);
     try { fs.writeFileSync(CONFIG.interruptFile, '1'); } catch (e) {}
     try { await browser.close(); } catch (e) {}
     process.exit(0);
@@ -651,10 +581,10 @@ async function runScan(browser) {
   try {
     await runScan(browser);
   } catch (e) {
-    log.err('Run failed:', e.message);
+    log.err('Runner crashed:', e.message);
     process.exitCode = 1;
   } finally {
     await browser.close();
-    console.log(`\n[MAIN] Done in ${((Date.now() - t0) / 1000).toFixed(1)}s\n`);
+    console.log(`\n[MAIN] Session finished in ${((Date.now() - t0) / 1000).toFixed(1)}s\n`);
   }
 })();
