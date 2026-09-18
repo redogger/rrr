@@ -1,20 +1,26 @@
-# 🛡️ DULMS Watcher v10.2 — Personal Guard Edition
+# 🛡️ DULMS Watcher v10.4 — Personal Guard Edition
 
-بوت مخصص لثلاث وظائف دون إهدار موارد:
+بوت مراقبة لمادة GEN 101 (English Language 2) على DULMS.
 
-1. **قناص الكورسات (GEN 101):** فحص دقيق كل 10 ثواني لمادة GEN 101 فقط.
-2. **الحارس الشخصي للتسجيل:** حفظ قائمة الكورسات المسجلة ومراجعتها كل 10 دقائق (تحذير فوري عند إلغاء مادة).
-3. **التحقق الحي (Telegram Ping):** أرسل `/start` لبوت التيليجرام في أي وقت ليرد بأنه يستيقظ ويعمل.
+## 🎯 3 مهام أساسية
 
-## 🧩 البنية
+1. **Early Detection** — يراقب ظهور GEN 101 كل 10 ثواني، ويبعت إشعار + صوت 🔔 فور ظهورها.
+2. **Sniper** — بعد ظهور المادة، يراقب مجموعاتها كل 10 ثواني ويبعت إشعار لما أي مجموعة فيها مقاعد فاضية.
+3. **Security Guard** — يراقب المواد المسجلة كل 10 دقائق وينبهك لو أي مادة اتشالت.
 
-- `watch.js` — نقطة الدخول + الحلقة الرئيسية.
-- `lib/core.js` — الإعدادات، الـ logger، الأدوات، الحالة، الجلسة، الـ shutdown.
-- `lib/telegram.js` — كل ما يخص Telegram (send + commands + callbacks).
-- `lib/browser.js` — تشغيل Playwright، اعتراض AJAX، عميل API، ووحدات الفحص.
+## 🆕 v10.4 — ما الجديد
+
+- ✅ حفظ الحالة **قبل** أي عملية شبكة → لن تفقد `state` حتى لو فشل تسجيل الدخول.
+- ✅ إشعار تيليجرام فوري عند أي crash مع نص الخطأ.
+- ✅ **Auto-resume**: لو البوت كان Paused من run سابق، يُلغى تلقائياً.
+- ✅ **Multi-selector login**: يجرّب 4 selectors مختلفة لحقول الدخول.
+- ✅ **تصنيف ذكي** لسبب فشل الدخول: `captcha_required` / `invalid_credentials` / `account_locked` / `site_maintenance`.
+- ✅ **4 محاولات** دخول مع backoff متزايد.
+- ✅ **Dump تلقائي** للحالة والـ audit في GitHub Actions عند أي فشل.
 
 ## ⚙️ بدء التشغيل
-1. أضف الـ Secrets الأربعة في إعدادات المستودع:
+
+1. أضف الأسرار الأربعة في `Settings → Secrets and variables → Actions`:
    - `DULMS_USERNAME`
    - `DULMS_PASSWORD`
    - `TG_TOKEN`
@@ -22,6 +28,15 @@
 2. فعّل `Read and write permissions` من Workflow permissions.
 3. تبويب **Actions** → **Run workflow**.
 
-## ⌨️ أوامر البوت الأساسية
+## 🔍 تشخيص فشل الدخول
+
+بعد أي run فاشل، افتح:
+- `Actions → آخر run → Dump state on failure` — سترى:
+  - `.dulms-state.json` مع حقل `lastError.phase = "login"` أو `"fatal"`
+  - `.dulms-audit.log` مع حدث `login_failed`
+- أو حمّل الـ artifact `dulms-state-v104` من نفس الـ run.
+
+## ⌨️ الأوامر
+
 `/start` `/status` `/early` `/baseline` `/find` `/diag` `/groups` `/open`
 `/info` `/target` `/watch` `/unwatch` `/reset` `/audit` `/pause` `/resume` `/help`
