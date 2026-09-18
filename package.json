@@ -1,11 +1,10 @@
 {
   "name": "dulms-watcher",
-  "version": "9.0.0",
-  "description": "Fortress Edition — API-First Intelligent Sniper & Personal Guard for DULMS",
+  "version": "9.1.0",
+  "description": "English Sniper Edition — DULMS Watcher",
   "main": "watch.js",
   "scripts": {
-    "start": "node watch.js",
-    "test": "node watch.js --dry-run"
+    "start": "node watch.js"
   },
   "dependencies": {
     "playwright": "^1.49.0"
